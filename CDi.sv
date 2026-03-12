@@ -169,8 +169,12 @@ module emu (
     // 1 - D-/TX
     // 2..6 - USR2..USR6
     // Set USER_OUT to 1 to read from USER_IN.
-    input  [6:0] USER_IN,
-    output [6:0] USER_OUT,
+    // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
+    output        USER_OSD,
+    output  [1:0] USER_MODE,
+    input   [7:0] USER_IN,
+    output  [7:0] USER_OUT,
+    // [MiSTer-DB9 END]
 
     input OSD_STATUS
 );
@@ -183,7 +187,9 @@ module emu (
 `endif
 
     assign ADC_BUS = 'Z;
-    assign USER_OUT = '1;
+    // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support - USER_OUT now driven by boilerplate below
+    //assign USER_OUT = '1;
+    // [MiSTer-DB9 END]
     assign {UART_RTS, UART_DTR} = 0;
     assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 `ifdef VERILATOR
@@ -206,6 +212,62 @@ module emu (
     assign LED_DISK = 0;
     assign LED_POWER = 0;
     assign BUTTONS = 0;
+
+    //////////////////////////////////////////////////////////////////
+
+    // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
+    wire         CLK_JOY = CLK_50M;         //Assign clock between 40-50Mhz
+    wire   [2:0] JOY_FLAG  = {status[126],status[127],status[125]};
+    wire         JOY_CLK, JOY_LOAD, JOY_SPLIT, JOY_MDSEL;
+    wire   [5:0] JOY_MDIN  = JOY_FLAG[2] ? {USER_IN[6],USER_IN[3],USER_IN[5],USER_IN[7],USER_IN[1],USER_IN[2]} : '1;
+    wire         JOY_DATA  = JOY_FLAG[1] ? USER_IN[5] : '1;
+    assign       USER_MODE = JOY_FLAG[2:1] ;
+    assign       USER_OSD  = joydb_1[10] & joydb_1[6];  // Start+C opens OSD
+
+    // Active controller type:  JOY_FLAG[2]=DB9MD, JOY_FLAG[1]=DB15, JOY_FLAG[0]=2Players
+    assign USER_OUT = JOY_FLAG[2] ? {3'b111,JOY_SPLIT,3'b111,JOY_MDSEL}
+                    : JOY_FLAG[1] ? {6'b111111,JOY_CLK,JOY_LOAD}
+                    : '1;
+
+    // Unified joystick signals from DB controllers
+    wire [15:0] joydb_1 = JOY_FLAG[2] ? JOYDB9MD_1 : JOY_FLAG[1] ? JOYDB15_1 : '0;
+    wire [15:0] joydb_2 = JOY_FLAG[2] ? JOYDB9MD_2 : JOY_FLAG[1] ? JOYDB15_2 : '0;
+    wire        joydb_1ena = |JOY_FLAG[2:1]              ;
+    wire        joydb_2ena = |JOY_FLAG[2:1] & JOY_FLAG[0];
+
+    //----BA 9876543210
+    //----MS ZYXCBAUDLR
+    reg [15:0] JOYDB9MD_1,JOYDB9MD_2;
+    joy_db9md joy_db9md
+    (
+      .clk       ( CLK_JOY    ), //40-50MHz
+      .joy_split ( JOY_SPLIT  ),
+      .joy_mdsel ( JOY_MDSEL  ),
+      .joy_in    ( JOY_MDIN   ),
+      .joystick1 ( JOYDB9MD_1 ),
+      .joystick2 ( JOYDB9MD_2 )
+    );
+
+    //----BA 9876543210
+    //----LS FEDCBAUDLR
+    reg [15:0] JOYDB15_1,JOYDB15_2;
+    joy_db15 joy_db15
+    (
+      .clk       ( CLK_JOY   ), //48MHz
+      .JOY_CLK   ( JOY_CLK   ),
+      .JOY_DATA  ( JOY_DATA  ),
+      .JOY_LOAD  ( JOY_LOAD  ),
+      .joystick1 ( JOYDB15_1 ),
+      .joystick2 ( JOYDB15_2 )
+    );
+
+    // Joystick mux: DB9/DB15 -> USB fallback
+    // Direct mapping: [3:0]=UDLR, [4]=A/B1, [5]=B/B2, [6]=C/B1+B2
+    // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joystick mux with OSD guard
+    wire [15:0] JOY0 = joydb_1ena ?
+        (OSD_STATUS ? 16'b0 : {9'b0, joydb_1[6:4], joydb_1[3:0]})
+        : JOY0_USB;
+    // [MiSTer-DB9 END]
 
     //////////////////////////////////////////////////////////////////
 
@@ -236,6 +298,12 @@ module emu (
         "O[5],Overclock input device,No,Yes;",
         "O[14],Autoplay,Yes,No;",
 
+        // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
+        "O[127:126],UserIO Joystick,Off,DB9MD,DB15;",
+        "O[125],UserIO Players, 1 Player,2 Players;",
+        "-;",
+        // [MiSTer-DB9 END]
+
         "-;",
         "T[0],Reset;",
         "R[0],Reset and close OSD;",
@@ -256,7 +324,7 @@ module emu (
 
     wire [ 10:0] ps2_key;
 
-    wire [ 15:0] JOY0  /*verilator public_flat_rw*/;
+    wire [ 15:0] JOY0_USB  /*verilator public_flat_rw*/;
     wire [ 15:0] JOY0_ANALOG  /*verilator public_flat_rw*/;
     wire [ 24:0] MOUSE  /*verilator public_flat_rw*/;
 
@@ -348,7 +416,11 @@ module emu (
         .ps2_mouse(MOUSE),
 
         .joystick_l_analog_0(JOY0_ANALOG),
-        .joystick_0(JOY0),
+        .joystick_0(JOY0_USB),  // [MiSTer-DB9] renamed for DB9/SNAC8 mux
+
+        // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
+        .joy_raw(OSD_STATUS ? ({USER_MODE, joydb_1[11:0] | joydb_2[11:0]}) : 14'b0),
+        // [MiSTer-DB9 END]
 
         .RTC(hps_rtc)
     );
