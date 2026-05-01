@@ -26,7 +26,7 @@ CORE_NAME=(CDi)
 MAIN_BRANCH="main"
 COMPILATION_INPUT=(CDi.qpf)
 COMPILATION_OUTPUT=(output_files/CDi.rbf)
-QUARTUS_IMAGE="theypsilon/quartus-lite-c5:17.0.2.docker0"
+QUARTUS_IMAGE="${QUARTUS_IMAGE:?QUARTUS_IMAGE env not set — populated by workflow Resolve-Quartus-image step}"
 
 if [[ "${FORCED:-false}" != "true" ]] && \
    [[ "$(git log -n 1 --pretty=format:%an)" == "The CI/CD Bot" ]] && \
