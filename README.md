@@ -1,24 +1,49 @@
 # CDi_MiSTer
 
 A project dedicated to create an FPGA implementation of the Philips CD-i to be usable for the MiSTer FPGA project.
-As every Philips CD-i player has a different hardware, this project focuses on reverse engineering the "Mono I" PCB.
+As every Philips CD-i player is based on different hardware, this project focuses on reverse engineering the "Mono I".
 This mainboard is used in models like the 210/00, 210/05 or 220/20.
 
-Most games which only utilize the hardware of a base CD-i, should work as expected.
-Titles which require the Digital Video Cartridge will **NOT** work as the required
-hardware doesn't exist yet. The RAM expansion of the DVC is included and will enhance some games.
+This project also aims to replicate the 22ER9141 Digital Video Cartridge based on the VMPEG hardware.
+
+Most games utilizing the hardware of a base CD-i, should work as expected.
+Titles which require the Digital Video Cartridge are considered experimental.
 
 ## Usage
 
+To play a title, load a CD and press on the play button at the start screen.
+CD images can be stored as CHD or CUE/BIN format.
+
+### Button layout
+
+The CD-i usually has 2 buttons: • and ••
+Originally, this project aimed for replicating the `Philips RV 8701 Paddle Controller`.
+That has one downside of having no •/•• button, to press • and •• at the same time. Some games really need it.
+
+So instead, this project currently aims for a hybrid of the `RV 8701` and a `Philips 22ER9017 Touchpad`,
+which is similar to a `Gravis Ultrapad`. The layout can be compared to a SNES controller without shoulder buttons.
+Since the MiSTer is built around the modern PSX layout, this should be pretty accessible.
+
+### Required ROM files
+
 Place `cdi200.rom` as `boot0.rom` in `/media/fat/games/CD-i`.
 Place `zx405042p__cdi_slave_2.0__b43t__zzmk9213.mc68hc705c8a_withtestrom.7206` as `boot1.rom` next to it.
+Place `vmpega_split.rom` as `boot2.rom` next to it for DVC functionality.
 
 This core is tested against these files and their respective md5sum:
 
     2969341396aa61e0143dc2351aaa6ef6  cdi200.rom
     3d20cf7550f1b723158b42a1fd5bac62  zx405042p__cdi_slave_2.0__b43t__zzmk9213.mc68hc705c8a_withtestrom.7206
+    9694c466f9b65c1990a81b7a6280546b  vmpega_split.rom
+    53ba3bf7443187a657baa272d01d3771  vmpega.rom
 
-Due to legal reasons, they must be sourced separately.
+Due to legal reasons, they must be sourced separately!
+
+To generate the vmpeg_split rom, use this:
+
+    dd if=vmpega.rom bs=1024 count=128 of=vmpega_split.rom
+
+### NvRAM storage
 
 Save files are stored inside an 8K NvRAM. MiSTer will create one save file per CD.
 Whenever the NvRAM state changes, the "User" LED will light up, indicating
@@ -26,93 +51,78 @@ a change is queued to store. When the OSD is opened, the NvRAM will be flushed t
 
 The save files containing the NvRAM are compatible with the CD-i emulation of MAME.
 
-Digital gamepads, analog gamepads and mice are supported for use with this core.
-To play a title, load a CD and press on the play button at the start screen.
-CD images can be stored as CHD or CUE/BIN format.
+### Pointing Devices
+
+The Philips CD-i has support for 3 classes of "Pointing Devices"
+
+* Maneuvering devices -> Gamepad (Digital or Analog)
+* Relative Coordinate Devices -> Mouse and Trackball
+* Absolute Coordinate Devices -> Light Gun, Graphics Tablet, Light Pen (not yet supported)
+
+Digital gamepads, Analog gamepads and Mice are supported for use with this core.
+
+To switch between Mouse and Gamepad, simply move the Mouse around. The core will switch automatically
+by unplugging the current device and plugging in the next.
+
+### OSD
+
+* Audio & Video
+  * Video Region
+    * PAL/NTSC - essentially a 50/60 Hz switch. PAL is preferred for the CD-i, reset required to apply
+  * Aspect Ratio
+  * Scale
+  * Vertical Crop - Off, On(270) - For improved integer scaling
+  * RGB Scale
+    * 0-255 - Full RGB range
+    * 16-235 - Reduced RGB range (might provide more accurate color / more contrast)
+* Hardware Config
+  * Ports - Either 1 Player with additional UART, or 2 players.*
+  * Disable VMPEG DVC - Reset core to take effect
+  * Overclock input device - Increase update rate (no longer accurate, but recommended for games)
+  * Fast CD Seek - Skip 20 sector seek delay, a real CDIC always ensures (might be unstable)
+  * CPU Turbo - Slightly increases CPU speed (might be unstable)
+  * NvRAM live update - Allows loading NvRAM from storage on CD image change without reset (might corrupt NvRAM)
+* Autoplay - Injects a kernel module into OS9 to skip the system menu and directly start the title (thx to CD-i Fan for this)
+
+Note*: 2 controllers are an unusual state for a CD-i machine. Keep that in mind.
 
 ## Troubleshooting
 
 * My NTSC CRT television set is not getting a stable image
   *  Please switch the core to NTSC and reset via OSD. This should fix the problem.
-  *  This can be performed blind with: OSD, Down, Action, 5x Down, Action
+* The image has a vertical offset
+  * Do you have used "NvRAM live update" together with a switch between PAL and NTSC? That might be the cause. Please reset the machine to fix the NvRAM.
+* The number of controllers is not updated
+  * Do you have used "NvRAM live update" together with a switch between PAL and NTSC? That might be the cause because the info is stored there. Please reset the machine to fix the NvRAM.
 
 ## Status
 
-Core Utilization:
+[Statistics generated by Quartus](doc/statistics.md)
 
-    Logic utilization (in ALMs)  13,856 / 41,910 ( 33 % )
-    Total registers              16295
-    Total block memory bits      630,471 / 5,662,720 ( 11 % )
-    Total DSP Blocks             66 / 112 ( 59 % )
+### TODOs and known issues
 
-### TODOs
+[This core is not yet feature complete](doc/todo.md)
 
-* Find a better solution for reducing CPU speed
-* Black flicker during intro of Ultimate Noah's Ark in 60 Hz mode
-    * A workaround is CPU overclocking. Problem not visible on real machine.
-* Give a signal to the user when CPU data stalling occured
-* Find a better solution for CD data stalling (take a screenshot or plug in a USB device)
-    * PSX core seems to halt the whole machine to avoid this situation
-* Fix regression: Audio hiccups during Philips Logo in Burn:Cycle
-    * A workaround is CPU overclocking
-* Add missing MCD212 features
-    * Pixel Hold
-* Investigate input responsiveness (skipped events?)
-* Investigate screeching sound effect in the menu of "Golf Tips"
-* Fix hang on audio track stop or change in media player
-* Cheat support?
-* Digital Video Cartridge MPEG Decoder
-* Investigate "Gray border glitch" at the top of "Myst" gameplay (seems to be only one plane)
-* Fix reset behaviour (Core is sometimes hanging after reset)
-* Investigate desaturated colors / low contrast in "Photo CD Sample Disc"
-    * Probably fixable with 16-235 to 0-255 scaling
-    * More investigation needed
-* Find a solution for the video mode reset during system resets
-    * The ST flag is the issue here, causing a video mode change
-* Add SNAC support (IR remote + wired controller)
-    * RC5 support is added. A test using real hardware is required.
-* Add 2 player support
-* CD+G
-* Possibly adding support for other PCBs (like Mono II)
-* Refurbish I2C for the front display and show the content as picture in picture during changes?
-    * It might not even be required at all.
+### Usage for CD-i homebrew development?
+
+By the time of writing, an optical drive emulator is not available for physical CD-i machines.
+It is therefore encouraged to test on CD-i emulators before burning to disc.
+[This core can be used to test your creations to some extent](doc/cdi_homebrew.md)
 
 ### Issues with external dependencies
 
 * A dump of the SLAVE 3.2 ROM is required to fix some hacks
-    * I2C front panel data is not correctly handled (e.g. Play button)
-    * The IR codes from the Remote have the same issue when media control buttons are used.
-
-## Simulation
-
-Even so, the [sim](sim) folder seems to be the correct one, it is deprecated.
-It was used for mixed language simulation with the free version of ModelSim when the project has started.
-
-The [sim2](sim2) folder is the current one, used for most development and makes use of Verilator for improved performance.
-
-## Used resources
-
-This MiSTer core would've probably never been possible without the reverse engineering efforts of certain people.
-Thanks to [CD-i Fan](https://www.cdiemu.org/) for the insights into his closed source CD-i Emulator.
-Also Thanks to MooglyGuy, which took on the task of implementing a CD-i emulator into MAME, which I used to analyse
-the program flow of the CD-i boot process.
-
-* https://github.com/TobiFlex/TG68K.C
-* https://opencores.org/projects/68hc05
-* https://github.com/cdifan/cdichips
-* http://www.icdia.co.uk/microware/index.html
-* https://github.com/Stovent/CeDImu/blob/master/src/CDI/OS9/SystemCalls.hpp
-* playcdi (by CD-i Fan) (auto play for Mono I PCB)
+  * I2C front panel data is not correctly handled (e.g. Play button)
+  * The IR codes from the Remote have the same issue when media control buttons are used.
 
 ## FAQ, Issues and Quirks
 
-The production quality of the CD-i hardware and the software running on it is sometimes questionable.
-For this reason, I've created a small list of some known quirks, someone might suspect of being caused
+The production quality of CD-i hardware and software is sometimes questionable.
+For this reason, I've created a list of some known quirks, one might suspect of being caused
 by emulation errors but are also present on the real machine.
 
 * Is the "Digital Video Cartridge" supported?
-    * No! Please stop asking!
-    * Potential development on the DVC might only start after everything works without bugs on the base machine.
+    * Please stop asking! >.<
 * The map of "Zelda - Wand of Gamelon" has micro jitter during scrolling
     * This also happens on real 210/05 hardware
 * "Hotel Mario" seems to have the first samples of every ingame song repeated
@@ -165,4 +175,42 @@ by emulation errors but are also present on the real machine.
   * "Oh No!" *Explodes* It is running as slow as on real hardware,
     but it seems that the CPU Turbo fixes this issue and makes it behave
     more like the Amiga version.
+* There is a small green artifact at the top left of the Philips Intro in "Lost Eden"
+  * I thought that this is a decoding error, but it is actually there on real hardware
+* "Lost Eden" hangs for 1-2 seconds when the music restarts
+  * This seems to be an oversight by the developers. It occurs on real hardware all well.
+* Graphical glitches at the top of the Philips Intro in "Mystic Midway - Rest in Pieces"
+  * Yes, those exist on real hardware as well and are maybe hidden by overscan
+  * A side note, "Dr. Dearth" was probably filmed in front of a blue screen, but the cut out is not very good.
+    Blue pixels at the edges are visible on real hardware as well.
+* "The Lost Ride"
+  * It sometimes has an unexpected mirrored column of pixels on the right side of the screen
+    * This happens on real hardware as well. This seems to be an oversight by the developer.
+  * The main menu has a weird freeze frame when the cutscene before that is skipped
+    * Like on real hardware. I don't know what they were thinking.
+* During the intro of "The Ultimate Noah's Ark", the Mike Wilks artwork has repeated pixels on the bottom and right edge.
+  * This looks wrong but real hardware does that too.
+  * There is also a weirdly wrong column of pixels during the title page on the left inside the black frame
+* "Marlboro – Follow Your Dreams" is not booting and hangs on a cyan screen
+  * You are probably using NTSC mode. Being made by a German publisher, this title was probably only tested on European models. It behaves like this on real hardware as well
 
+## Simulation
+
+Even so, the [sim](sim) folder seems to be the correct one, it is deprecated.
+It was used for mixed language simulation with the free version of ModelSim when the project has started.
+
+The [sim2](sim2) folder is the current one, used for most development and makes use of Verilator for improved performance.
+
+## Used resources
+
+This MiSTer core would've probably never been possible without the reverse engineering efforts of certain people.
+Thanks to [CD-i Fan](https://www.cdiemu.org/) for the insights into his closed source CD-i Emulator.
+Also Thanks to MooglyGuy, which took on the task of implementing a CD-i emulator into MAME, which I used to analyse
+the program flow of the CD-i boot process.
+
+* https://github.com/TobiFlex/TG68K.C
+* https://opencores.org/projects/68hc05
+* https://github.com/cdifan/cdichips
+* http://www.icdia.co.uk/microware/index.html
+* https://github.com/Stovent/CeDImu/blob/master/src/CDI/OS9/SystemCalls.hpp
+* playcdi (by CD-i Fan) (auto play for Mono I PCB)

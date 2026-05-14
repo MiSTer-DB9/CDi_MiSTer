@@ -32,6 +32,21 @@ Because of clken, fOSC is 15 MHz
 
 A division by 30 would be required.
 
+## Infrared Input
+
+The [RC5 protocol](https://www.opendcc.de/info/rc5/rc5.html) is used.
+According to this source, the modulation frequency would be 36 kHz.
+According to the service manual of the CDI 210/05, the GP1U52X Ir receiver is used.
+According to the datasheet of this receiver, the modulation frequency is 40 kHz.
+The transmitting diode inside the Thumbstick Controller 22ER9051 (also known as RV 6701/00) is unknown.
+Using a photo diode, I've measured the actual frequency, which occured to be 36 kHz.
+So a possible receiver circuit should be based on that.
+
+For some reason, the "Philips_CDI_220_(00)_Service_Manual" claims that a GPU521X is used.
+This part doesn't exist but The GP1U521X does and uses 38 kHz.
+It should be noted that [RC-6](https://www.sbprojects.net/knowledge/ir/rc6.php) also exists
+which a according to this website also uses 36 kHz.
+
 ## Observations
 
 ### Timing when asking for Region
@@ -69,6 +84,19 @@ With SLAVE 2.0
 
     87 20 ff  (Notice the missing A1)
 
+
+### Eject button on front panel
+
+With SLAVE 3.2
+
+    a1 87 00 ff
+
+With SLAVE 2.0
+
+    87 08 (??)
+
+This might be totally wrong, but the missing A1 is again visibly.
+
 ## PAL/NTSC responses on F6
 
     PAL  f6 02
@@ -90,7 +118,7 @@ With SLAVE 2.0
     0059 Checked on Unmute
     0063 Bit 4 set on channel 0 83?
     0064 Timer High (ACHR) is stored here at 0571
-         Written after Unmute but not always. There is a 
+         Written after Unmute but not always. There is a
          comparsion involved between ACHR and 0x0064. Fading?
     0066 SERVO SPI Byte 0
     0067 SERVO SPI Byte 1

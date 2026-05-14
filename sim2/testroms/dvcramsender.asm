@@ -13,8 +13,9 @@ start_delay:
 	add #-1,d0
 	bne start_delay
 
-	lea rom,a0
-	move.l #524288,d1
+	; Send DVC RAM
+	move.l #$d00000,a0
+	move.l #1048576,d1
 loop:
 
 wait_till_ready:
@@ -27,9 +28,7 @@ wait_till_ready:
 	adda.l #1,a0
 	add.l #-1,d1
 	bne loop
-
+	
 end:
 	bra end
 
-rom:
-	incbin "cdimono1/cdi200.rom"

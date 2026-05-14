@@ -7,10 +7,6 @@ vector:
     dc.l main
 
 main:
-	; Make a pause at the start to relax the UART on the linux side
-	move #4000,d0
-	jsr wait
-
 	move.l #cdicirq,$200
 	move #$2000,SR  
 
@@ -20,29 +16,26 @@ main:
 	move.w #$8000,$303FFE ; Data buffer
 
 	move.w #$2480,$303FFC ; Interrupt Vector
-	move.w #$002c,$303C00 ; Read Mode 1
-	move.l #$21080000,$303C02 ; Time Register
-	move.w #$8000,$303FFE ; Start the Read
+	move.w #$0029,$303C00 ; Read Mode 1
+	move.l #$0021600,$303C02 ; Time Register
+	move.w #$C000,$303FFE ; Start the Read
+
+	move.l #$2000,A3
+	move.b #'A',$80002019
 
 	jsr waitforirq
 
-	move.w #$0000,$303FFE ; Data buffer = 0, disable reading
+	move.b #'B',$80002019
 
-	; Send CDIC DATA1 buffer
-	move.l #$300a00,a0
-	move.l #$0a00,d1
-loop:
+	jsr waitforirq
 
-wait_till_ready:
-	move.b $80002013,d0
-	btst.l #$2,d0
-	beq wait_till_ready
+	move.b #'C',$80002019
 
-	move.b (a0),d0
-	move.b d0,$80002019
-	adda.l #1,a0
-	add.l #-1,d1
-	bne loop
+	move.w #$0000,$303FFE ; Stop the Read
+	move.w #$C000,$303FFE ; Start the Read
+
+	jsr waitforirq
+	jsr waitforirq
 
 endless:
 	bra endless
@@ -58,9 +51,11 @@ waitforirq:
 waitforirqloop:
 	cmp #0,d0
 	beq waitforirqloop
+	move.b #'O',$80002019
 	rts
 
 cdicirq:
+	move.b #'I',$80002019
 	move.w $303FF4,d0 ; clear flags on ABUFD
 	move.w $303FF6,d0 ; clear flags on XBUF
 	;move.b #$92,$80004005

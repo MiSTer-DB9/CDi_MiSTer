@@ -20,21 +20,26 @@ I assume the ATTEX limits the DRAM to 0x27fffe as these do now follow.
     0x310000                SLAVE
     0x320000 to 0x323fff    NVRAM (according to mame)
 
-    0x400000 to 0x4ffbff    ROM but only 512kB so it ends 0x80000 -> MiSTer SDRAM 0x400000 to 0x47FFFF
-    0x4ffc00 to 0x4fffdf    MCD212 SystemIO (is this even used? at least not mentioned in MAME)
+    0x400000 to 0x4ffbff    ROM but only 512kB so it ends 0x80000                           -> MiSTer SDRAM 0x400000 to 0x47FFFF
+    0x4ffc00 to 0x4fffdf    MCD212 SystemIO (is this even used?)
     0x4fffe0 to 0x4fffff    MCD212 according to MAME, channels 1+2 according to datasheet
 
-    0xd00000 to 0xdfffff    DVC RAM block 1 (according to mame) 1MB -> MiSTer SDRAM 0x100000 to 0x1fffff
-    0xe80000 to 0xefffff    DVC RAM block 2 (according to mame) 512kB -> MiSTer SDRAM 0x200000 to 0x27ffff
+    0xd00000 to 0xdfffff    VMPEG System RAM (1MB)                                          -> MiSTer SDRAM 0x100000 to 0x1fffff
+    0xe00000 to 0xe01ffe    VMPEG VCD pixel clock selection latch (mirrored a lot)
+    0xe03000 to 0xe03024    VMPEG FMA (DSP56k via indirect access)
+    0xe04000 to 0xe040f4    VMPEG FMV (MCD251)
+    0xe40000 to 0xe5ffff    VMPEG ROM (128K vmpega.rom)     -> MiSTer SDRAM 0x480000
+    0xe60000 to 0xe7ffff    VMPEG ROM (mirrored)
+    0xe80000 to 0xefffff    VMPEG MCD251 Memory for Video decoding (512kB)                  -> MiSTer SDRAM 0x200000 to 0x27ffff
 
-    0xf00000 to 0xf00068    Dummy player shell which starts a CD-i application (by cdifan)
+    0xf00000 to 0xf00068    Dummy player shell which starts a CD-i application (by CD-i Fan)
 
 ## Bus Error
 
 Some locations are not mapped to memory and will cause a bus error exception on a CDI 210/05
 
     0x080000 to 0x1fffff
-    0x500000 to 0xefffff
+    0x500000 to 0xcfffff
 
 ## CPU Internal
 
@@ -73,6 +78,22 @@ Some locations are not mapped to memory and will cause a bus error exception on 
     0x80004015  DMA Channel 0 Device Address Counter
     0x80004016  DMA Channel 0 Device Address Counter
     0x80004017  DMA Channel 0 Device Address Counter Low
+    0x80004040  DMA Channel 1 Status
+    0x80004041  DMA Channel 1 Error
+    0x80004044  DMA Channel 1 Device Control
+    0x80004045  DMA Channel 1 Operation Control
+    0x80004046  DMA Channel 1 Sequence Control
+    0x80004047  DMA Channel 1 Channel Control
+    0x8000404a  DMA Channel 1 Memory Transfer Counter High
+    0x8000404b  DMA Channel 1 Memory Transfer Counter Low
+    0x8000404c  DMA Channel 1 Memory Address Counter High
+    0x8000404d  DMA Channel 1 Memory Address Counter
+    0x8000404e  DMA Channel 1 Memory Address Counter
+    0x8000404f  DMA Channel 1 Memory Address Counter Low
+    0x80004054  DMA Channel 1 Device Address Counter High
+    0x80004055  DMA Channel 1 Device Address Counter
+    0x80004056  DMA Channel 1 Device Address Counter
+    0x80004057  DMA Channel 1 Device Address Counter Low
 
 ## Auto refresh
 

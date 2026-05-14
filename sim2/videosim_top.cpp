@@ -64,8 +64,16 @@ static bool do_trace{true};
 #endif
 volatile sig_atomic_t status = 0;
 
+// #define CROP
+
+#ifdef CROP
+const int width = 1536; // 768*2
+const int height = 280;
+#else
 const int width = 120 * 16;
 const int height = 312;
+#endif
+
 const int size = width * height * 3;
 const int png_height_scale = 4;
 
@@ -202,9 +210,6 @@ class CDi {
     int frame_index = 0;
 
   private:
-    FILE *f_audio_left{nullptr};
-    FILE *f_audio_right{nullptr};
-
     uint8_t output_image[size] = {0};
     uint32_t regfile[16];
 #ifdef TRACE
@@ -359,32 +364,8 @@ class CDi {
         }
 #endif
 
-        // Simulate CD data delivery from HPS
+        // Ignore CD data delivery from HPS
         if (dut.rootp->emu__DOT__cd_hps_req && sd_rd_q == 0 && dut.rootp->emu__DOT__nvram_hps_ack == 0) {
-            assert(dut.rootp->emu__DOT__cd_hps_ack == 0);
-            dut.rootp->emu__DOT__cd_hps_ack = 1;
-
-            uint32_t lba = dut.rootp->emu__DOT__cd_hps_lba;
-            uint32_t m_time = dut.rootp->emu__DOT__cditop__DOT__cdic_inst__DOT__time_register;
-
-            uint32_t reference_lba = lba_from_time(m_time);
-            // assert(lba == reference_lba);
-            // assert(lba >= 150);
-
-            if (lba < 150)
-                lba += 150;
-            uint32_t file_offset = (lba - 150) * kSectorSize;
-
-            printf("Request CD Sector %x %x %x\n", m_time, lba, file_offset);
-
-            int res = fseek(f_cd_bin, file_offset, SEEK_SET);
-            assert(res == 0);
-
-            fread(hps_buffer, 1, kSectorSize, f_cd_bin);
-
-            struct subcode &out = *reinterpret_cast<struct subcode *>(&hps_buffer[kSectorSize / 2]);
-            subcode_data(dut.rootp->emu__DOT__cd_hps_lba, out);
-            hps_buffer_index = 0;
         }
 
         if (dut.rootp->emu__DOT__nvram_hps_rd && sd_rd_q == 0 && dut.rootp->emu__DOT__cd_hps_ack == 0) {
@@ -531,14 +512,6 @@ class CDi {
             pixel_index = 0;
         }
 
-        // Simulate Audio
-        if (dut.rootp->emu__DOT__cditop__DOT__cdic_inst__DOT__sample_tick) {
-            int16_t sample_l = dut.rootp->emu__DOT__cditop__DOT__cdic_inst__DOT__adpcm__DOT__fifo_out_left;
-            int16_t sample_r = dut.rootp->emu__DOT__cditop__DOT__cdic_inst__DOT__adpcm__DOT__fifo_out_right;
-            fwrite(&sample_l, 2, 1, f_audio_left);
-            fwrite(&sample_r, 2, 1, f_audio_right);
-        }
-
         if (pixel_index < size - 6) {
             uint8_t r, g, b;
 
@@ -548,42 +521,31 @@ class CDi {
                 r = dut.VGA_R;
                 g = dut.VGA_G;
                 b = dut.VGA_B;
+#ifdef CROP
+                output_image[pixel_index++] = r;
+                output_image[pixel_index++] = g;
+                output_image[pixel_index++] = b;
+#endif
             }
 
-            if (dut.VGA_HS) {
-                r += 100;
-            }
-
-            if (dut.VGA_VS) {
-                g += 100;
-            }
-
+#ifndef CROP
             output_image[pixel_index++] = r;
             output_image[pixel_index++] = g;
             output_image[pixel_index++] = b;
+#endif
         }
     }
 
     virtual ~CDi() {
-        fclose(f_audio_right);
-        fclose(f_audio_left);
     }
     CDi(int i) {
         instanceid = i;
-
-        char filename[100];
-        sprintf(filename, "%d/audio_left.bin", instanceid);
-        fprintf(stderr, "Writing to %s\n", filename);
-        f_audio_left = fopen(filename, "wb");
-
-        sprintf(filename, "%d/audio_right.bin", instanceid);
-        fprintf(stderr, "Writing to %s\n", filename);
-        f_audio_right = fopen(filename, "wb");
 
 #ifdef TRACE
         dut.trace(&m_trace, 5);
 
         if (do_trace) {
+            char filename[100];
             sprintf(filename, "/tmp/waveform.vcd", instanceid);
             fprintf(stderr, "Writing to %s\n", filename);
             m_trace.open(filename);
@@ -766,6 +728,13 @@ void get_video_frame(std::string binpath, std::string pngpath) {
     fread(&machine.dut.rootp->emu__DOT__ram[0], 1, 1024 * 256 * 4, f);
     fclose(f);
 
+    // To support multiple endianesses, we use the second word to detect it
+    if (machine.dut.rootp->emu__DOT__ram[1] == 0x0015) {
+        for (int i = 0; i < 1024 * 256 * 2; i++) {
+            machine.dut.rootp->emu__DOT__ram[i] = bswap_16(machine.dut.rootp->emu__DOT__ram[i]);
+        }
+    }
+
     if (binpath == "ramdumps/frogfeast3.bin" || binpath == "ramdumps/frogfeast4.bin") {
         fprintf(stderr, "Overwrite CLUT\n");
         auto &clut = frogfeast_clut;
@@ -826,29 +795,32 @@ void get_video_frame(std::string binpath, std::string pngpath) {
     }
     machine.modelstep();
 
-    machine.write_png_file(pngpath.c_str());
-    // machine.write_png_file("1.png");
-    fprintf(stderr, "Written %s\n", pngpath.c_str());
+    // #define TWO_ROUNDS
 
-#if 0
+#ifdef TWO_ROUNDS
     // And again!
-    machine.modelstep();
     while (machine.dut.rootp->emu__DOT__cditop__DOT__mcd212_inst__DOT__video_y == 0) {
         machine.modelstep();
     }
     while (machine.dut.rootp->emu__DOT__cditop__DOT__mcd212_inst__DOT__video_y != 0) {
         machine.modelstep();
     }
-    machine.write_png_file("2.png");
-    fprintf(stderr, "Written %s\n", pngpath.c_str());
 #endif
+
+    machine.write_png_file(pngpath.c_str());
+    // machine.write_png_file("1.png");
+    fprintf(stderr, "Written %s\n", pngpath.c_str());
 }
 
 void forked_run() {
-    static constexpr size_t kNumberForks{12};
+    static constexpr size_t kNumberForks{14};
     std::vector<pid_t> child_pids;
 
-    auto ramdumps = glob("ramdumps/*.bin");
+    const char *env_ramdumps = std::getenv("CDI_RAMDUMPS");
+
+    std::string path = env_ramdumps ? (std::string(env_ramdumps) + "/*.bin") : "ramdumps/*.bin";
+    printf("Reading ram dumps from %s\n", path.c_str());
+    auto ramdumps = glob(path);
     size_t chunksize = std::max((size_t)ramdumps.size() / kNumberForks, (size_t)1);
     printf("Splitting %d ram dumps into %d sizes of %d\n", ramdumps.size(), kNumberForks, chunksize);
 
@@ -871,7 +843,8 @@ void forked_run() {
                 printf("Runner %d %s\n", runner, iterator->c_str());
 
                 auto binpath = *iterator;
-                auto pngpath = std::regex_replace(binpath, std::regex("ramdumps/(.*).bin"), "videosim/$1.png");
+                auto pngpath = std::regex_replace(binpath, std::regex(".*/(.*).bin"), "videosim/$1.png");
+
                 get_video_frame(binpath, pngpath);
 
                 iterator++;

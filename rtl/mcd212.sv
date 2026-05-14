@@ -44,15 +44,15 @@ module mcd212 (
     output bit        cpu_bus_ack,
     input             cs,
     input             dvc_ram_cs,
+    input             dvc_rom_cs,
 
-    output     [7:0] r,
-    output     [7:0] g,
-    output     [7:0] b,
-    output           hsync,
-    output           vsync,
-    output bit       hblank,
-    output           vblank,
-    output           vga_f1,
+    output rgb888_s vidout,
+    output          hsync,
+    output          vsync,
+    output bit      hblank,
+    output          vblank,
+    output          vga_f1,
+    output bit      vsd,
 
     output bit [24:0] sdram_addr,
     output bit        sdram_rd,
@@ -97,8 +97,6 @@ module mcd212 (
 
     // Bit 18 is the Bank selection for TD=0
     // CAS1 if A18=0, CAS2 if A18=1
-    // TODO This might be not accurate. Investigation needed
-    //wire [19:1] ram_address = {cpu_address[18], cpu_address[21], cpu_address[17:1]};
     wire [19:1] ram_address = {cpu_address[21], cpu_address[18], cpu_address[17:1]};
 
     bit sdram_busy_q = 0;
@@ -146,7 +144,7 @@ module mcd212 (
     bit file1_bus_ack;
     bit file1_burstdata_valid;
 
-    wire cpu_sdram_access = (cs_ram || cs_rom_fused || dvc_ram_cs) && (cpu_uds || cpu_lds);
+    wire cpu_sdram_access = (cs_ram || cs_rom_fused || dvc_ram_cs || dvc_rom_cs) && (cpu_uds || cpu_lds);
     wire sdram_refresh_request;
     bit cpu_starve;
 
@@ -174,7 +172,7 @@ module mcd212 (
 
     always_comb begin
         sdram_owner_next = CPU;
-        if (cpu_starve) sdram_owner_next = CPU_STARVE;
+        if (cpu_starve && cs_ram) sdram_owner_next = CPU_STARVE;
         if (file1_as) sdram_owner_next = FILE1;
         if (file0_as) sdram_owner_next = FILE0;
         if (ica1_as) sdram_owner_next = ICA_DCA1;
@@ -217,12 +215,11 @@ module mcd212 (
     end
 `endif
 
-    wire display_active;
-
     always_comb begin
         status_register1 = 0;
+        status_register1.da = !vblank;
+
         // TODO This might not be accurate
-        status_register1.da = display_active;
         status_register1.pa = fake_parity;
     end
 
@@ -298,22 +295,34 @@ module mcd212 (
                     if (cpu_sdram_access) begin
                         if (cs_rom_fused) begin
                             sdram_word = 1;
+                            // map 0x400000 to 0x0400000
                             sdram_addr[24:1] = {3'b001, cpu_address[21:1]};
                             sdram_addr[0] = 1'b0;
                             sdram_rd = !sdram_busy && !sdram_busy_q;
                             sdram_wr = 1'b0;
                         end else if (cs_ram) begin
+                            // map 0x000000 to 0x000000
+                            // map 0x200000 to 0x080000
                             sdram_addr[24:1] = {5'b0, ram_address[19:1]};
                             sdram_addr[0] = cpu_write_strobe ? !cpu_lds && cpu_uds : 1'b0;  // only active on odd byte accesses
                             sdram_word = (cpu_lds && cpu_uds) || !cpu_write_strobe;
                             sdram_rd = !cpu_write_strobe && !sdram_busy && !sdram_busy_q;
                             sdram_wr = cpu_write_strobe && !sdram_busy && !sdram_busy_q;
                         end else if (dvc_ram_cs) begin
+                            // map 0xd00000 to 0x100000
                             sdram_addr[24:1] = {1'b0, cpu_address[23:20] - 4'hc, cpu_address[19:1]};
                             sdram_addr[0] = cpu_write_strobe ? !cpu_lds && cpu_uds : 1'b0;  // only active on odd byte accesses
                             sdram_word = (cpu_lds && cpu_uds) || !cpu_write_strobe;
                             sdram_rd = !cpu_write_strobe && !sdram_busy && !sdram_busy_q;
                             sdram_wr = cpu_write_strobe && !sdram_busy && !sdram_busy_q;
+                        end else if (dvc_rom_cs) begin
+                            sdram_word = 1;
+                            // map 0xe40000 to 0x0480000
+                            // also map 0xe60000 to 0x0480000 (bit 17 must be ignored)
+                            sdram_addr[24:1] = {8'b00100100, cpu_address[16:1]};
+                            sdram_addr[0] = 1'b0;
+                            sdram_rd = !sdram_busy && !sdram_busy_q;
+                            sdram_wr = 1'b0;
                         end
                     end
                 end
@@ -360,7 +369,7 @@ module mcd212 (
         // only the CPU writes to SDRAM
         sdram_din = cpu_din;
 
-        if (cs_ram || dvc_ram_cs || cs_rom_fused) begin
+        if (cs_ram || dvc_ram_cs || dvc_rom_cs || cs_rom_fused) begin
             cpu_dout = sdram_dout;
         end else if (cs_channel1) begin
             case (cpu_addressb[7:0])
@@ -430,11 +439,13 @@ module mcd212 (
     wire [12:0] video_x;
     bit new_frame  /*verilator public_flat_rd*/;
     wire new_line  /*verilator public_flat_rd*/;
-    wire new_pixel;
+
     wire new_pixel_lores;
     wire new_pixel_hires;
+
     bit hblank_vt;
     bit hblank_vt_q;
+    bit hblank_vt_q2;
 
     bit vblank_latched;
     bit vblank_q;
@@ -481,11 +492,7 @@ module mcd212 (
         .vsync(vsync),
         .hblank(hblank_vt),
         .vblank(vblank),
-        .new_line(new_line),
-        .new_pixel(new_pixel),
-        .new_pixel_lores(new_pixel_lores),
-        .new_pixel_hires(new_pixel_hires),
-        .display_active(display_active)
+        .new_line(new_line)
     );
 
 
@@ -704,10 +711,13 @@ module mcd212 (
     always_ff @(posedge clk) begin
         if (reset) begin
             hblank_vt_q <= 0;
+            hblank_vt_q2 <= 0;
             hblank <= 0;
         end else begin
             hblank_vt_q <= hblank_vt;
-            hblank <= hblank_vt_q;
+            hblank_vt_q2 <= hblank_vt_q;
+
+            hblank <= hblank_vt_q2;
         end
 
     end
@@ -715,11 +725,13 @@ module mcd212 (
     pixelstream file0_out (.clk);
 
     // Plane A Display File Decoder
-    display_file_decoder #(
+    display_file_reader #(
         .unit_index(0)
     ) file0 (
         .clk,
         .reset(new_frame || reset || !command_register_dcr1.ic1),
+        .st(control_register_crsr1w.st),
+        .hsync(hsync),
         .address(file0_adr),
         .as(file0_as),
         .din(file0_din),
@@ -734,11 +746,13 @@ module mcd212 (
 
     pixelstream file1_out (.clk);
 
-    display_file_decoder #(
+    display_file_reader #(
         .unit_index(1)
     ) file1 (
         .clk,
         .reset(new_frame || reset || !command_register_dcr2.ic2),
+        .st(control_register_crsr1w.st),
+        .hsync(hsync),
         .address(file1_adr),
         .as(file1_as),
         .din(file1_din),
@@ -804,7 +818,7 @@ module mcd212 (
 
     delta_yuv_decoder dyuv0 (
         .clk,
-        .reset(reset || ica0_reload_vsr || vblank || new_line),
+        .reset(reset || ica0_reload_vsr || vblank || hsync),
         .st(control_register_crsr1w.st),
         .absolute_start_yuv(dyuv0_abs_start),
         .src(dyuv0_in),
@@ -815,7 +829,7 @@ module mcd212 (
 
     delta_yuv_decoder dyuv1 (
         .clk,
-        .reset(reset || ica1_reload_vsr || vblank || new_line),
+        .reset(reset || ica1_reload_vsr || vblank || hsync),
         .st(control_register_crsr1w.st),
         .absolute_start_yuv(dyuv1_abs_start),
         .src(dyuv1_in),
@@ -824,10 +838,10 @@ module mcd212 (
         .strobe(dyuv1_strobe)
     );
 
-    assign rle0_out.strobe = new_pixel;
-    assign rle1_out.strobe = new_pixel;
-    assign dyuv0_strobe = new_pixel;
-    assign dyuv1_strobe = new_pixel;
+    assign rle0_out.strobe = new_pixel_lores;
+    assign rle1_out.strobe = new_pixel_lores;
+    assign dyuv0_strobe = new_pixel_lores;
+    assign dyuv1_strobe = new_pixel_lores;
 
     bit [7:0] synchronized_pixel0;
     bit [7:0] synchronized_pixel1;
@@ -859,13 +873,51 @@ module mcd212 (
         if (clut_we1) clut_addr1 = clut_wr_addr1;
     end
 
+    typedef struct packed {
+        bit en;  //1 = mosaic on
+        bit [22:8] reserved;
+        bit [7:0] z;  // 1 normal, 2-255 mosaic effect
+    } mosaic_pixel_hold_factor_register_t;
+
+    mosaic_pixel_hold_factor_register_t mosaic_pixel_hold_factor_register_plane_a;
+    mosaic_pixel_hold_factor_register_t mosaic_pixel_hold_factor_register_plane_b;
+    bit [7:0] pixel_hold_cnt_a;
+    bit [7:0] pixel_hold_cnt_b;
+
+    bit pixel_hold_cnt_latch_a;
+    bit pixel_hold_cnt_latch_b;
+
     always_ff @(posedge clk) begin
         rgb555 <= {synchronized_pixel0, synchronized_pixel1};
+
+        plane_a_visible_q <= plane_a_visible;
+        plane_b_visible_q <= plane_b_visible;
+
+        pixel_hold_cnt_latch_a <= pixel_hold_cnt_a == 0 || !mosaic_pixel_hold_factor_register_plane_a.en;
+        pixel_hold_cnt_latch_b <= pixel_hold_cnt_b == 0 || !mosaic_pixel_hold_factor_register_plane_b.en;
 
         if (new_line) begin
             synchronized_pixel0 <= 0;
             synchronized_pixel1 <= 0;
+            pixel_hold_cnt_a <= 0;
+            pixel_hold_cnt_b <= 0;
+
         end else begin
+            if (pixel_hold_cnt_latch_a) plane_a_q <= plane_a;
+            if (pixel_hold_cnt_latch_b) plane_b_q <= plane_b;
+
+            if (new_pixel_plane_a && !hblank_vt_q2) begin
+                if (pixel_hold_cnt_a >= mosaic_pixel_hold_factor_register_plane_a.z - 1)
+                    pixel_hold_cnt_a <= 0;
+                else pixel_hold_cnt_a <= pixel_hold_cnt_a + 1;
+            end
+
+            if (new_pixel_plane_b && !hblank_vt_q2) begin
+                if (pixel_hold_cnt_b >= mosaic_pixel_hold_factor_register_plane_b.z - 1)
+                    pixel_hold_cnt_b <= 0;
+                else pixel_hold_cnt_b <= pixel_hold_cnt_b + 1;
+            end
+
             if (rle0_out.write && rle0_out.strobe) synchronized_pixel0 <= rle0_out.pixel;
             if (rle1_out.write && rle1_out.strobe) synchronized_pixel1 <= rle1_out.pixel;
 
@@ -885,8 +937,12 @@ module mcd212 (
         end
     end
 
+    wire new_pixel_plane_a = image_coding_method_register.cm13_10_planea == 4'b1011 ? new_pixel_hires : new_pixel_lores;
+    wire new_pixel_plane_b = image_coding_method_register.cm23_20_planeb == 4'b1011 ? new_pixel_hires : new_pixel_lores;
+
     always_ff @(posedge clk) begin
-        if (ica0_reload_vsr) `dp_vsr(("Reload VSR %x", ica0_vsr));
+        if (ica0_reload_vsr) `dp_vsr(("Reload VSR0 %x", ica0_vsr));
+        if (ica1_reload_vsr) `dp_vsr(("Reload VSR1 %x", ica1_vsr));
 
         if (dca0_read) `dp_dcaptr(("Start DCA0 on line %d", video_y));
         if (dca1_read) `dp_dcaptr(("Start DCA1 on line %d", video_y));
@@ -949,7 +1005,9 @@ module mcd212 (
     bit [5:0] weight_a;
     bit [5:0] weight_b;
 
+    // Y Position of active pixels. Used for cursor sprite
     bit [9:0] active_line = 0;
+    // Always high resolution pixels, used for Region effects
     bit [9:0] active_pixel = 0;
 
     bit [15:0] active_cursor_line;
@@ -967,15 +1025,27 @@ module mcd212 (
 
     localparam CURSOR_BLINK_PERIOD = 12;
 
+    bit [1:0] subpixelcnt;
+    assign new_pixel_lores = subpixelcnt[1:0] == 0 && !hblank_vt && !vblank;
+    assign new_pixel_hires = subpixelcnt[0] == 0 && !hblank_vt && !vblank;
+
+    bit inside_cursor_window_q;
+    bit cursor_pixel_q;
+
     // mouse cursor
     always_ff @(posedge clk) begin
-        if (hblank) active_pixel <= 0;
+        if (hblank_vt) subpixelcnt <= 0;
+        else subpixelcnt <= subpixelcnt + 1;
+
+        if (hblank_vt_q) active_pixel <= 0;
         else if (new_pixel_hires) active_pixel <= active_pixel + 1;
 
         if (vblank) active_line <= 0;
         else if (new_line) active_line <= active_line + 1;
 
         active_cursor_line <= cursor[4'(active_line-cursor_position_reg.y)];
+        inside_cursor_window_q <= inside_cursor_window;
+        cursor_pixel_q <= cursor_pixel;
 
         if (cursor_control_register.cuw) begin
             // Double Resolution
@@ -1028,7 +1098,8 @@ module mcd212 (
     // color mixing
     rgb888_s plane_a;
     rgb888_s plane_b;
-    rgb888_s vidout;
+    rgb888_s plane_a_q;
+    rgb888_s plane_b_q;
 
     rgb555_s rgb555;
 
@@ -1038,10 +1109,11 @@ module mcd212 (
         RGB888ToClut.b = rgb.b[7:2];
     endfunction
 
-    assign {r, g, b} = {vidout.r, vidout.g, vidout.b};
-
     bit plane_a_visible;
     bit plane_b_visible;
+
+    bit plane_a_visible_q;
+    bit plane_b_visible_q;
 
     bit [1:0] region_flags = 0;
 
@@ -1053,23 +1125,14 @@ module mcd212 (
             plane_a_dyuv_active <= 0;
             plane_b_dyuv_active <= 0;
         end else begin
-            // Kether is currently the only known title which switches to OFF coding mid frame.
-            // To avoid changing the pixel stream demux and causing alignment
-            // issues, the demux switch is only configured when not OFF.
-            // This might not be accurate and cause issues with other titles
-            // doing that and also switching coding in the meantime.
-            // If VSR is set again, then there might not be an issue
-
-            if (image_coding_method_register.cm13_10_planea != 0 || image_coding_method_register.cm23_20_planeb == 4'b0001)
-                plane_a_dyuv_active <= image_coding_method_register.cm13_10_planea == 4'b0101;
-            if (image_coding_method_register.cm23_20_planeb != 0)
-                plane_b_dyuv_active <= image_coding_method_register.cm23_20_planeb == 4'b0101;
+            plane_a_dyuv_active <= image_coding_method_register.cm13_10_planea == 4'b0101;
+            plane_b_dyuv_active <= image_coding_method_register.cm23_20_planeb == 4'b0101;
         end
     end
 
     // Ignore Color Key for DYUV. Use it only for CLUT!
-    wire plane_a_color_key_match = (clut_out0 == trans_color_plane_a) && !plane_a_dyuv_active;
-    wire plane_b_color_key_match = (clut_out1 == trans_color_plane_b) && !plane_b_dyuv_active;
+    wire plane_a_color_key_match = (clut_out0 == trans_color_plane_a) && !plane_a_dyuv_active && (image_coding_method_register.cm13_10_planea != 0);
+    wire plane_b_color_key_match = (clut_out1 == trans_color_plane_b) && !plane_b_dyuv_active && (image_coding_method_register.cm23_20_planeb != 0);
 
     function automatic [7:0] WeightCalc(input [7:0] rgb, input [5:0] weight);
         if (weight == 0) begin
@@ -1224,10 +1287,13 @@ module mcd212 (
     endfunction
 
     always_comb begin
+        bit backdrop_pixel;
+
         // start with the backdrop color
         vidout.r = backdrop_color_register.r ? 8'hff : 0;
         vidout.g = backdrop_color_register.g ? 8'hff : 0;
         vidout.b = backdrop_color_register.b ? 8'hff : 0;
+        backdrop_pixel = (!plane_a_visible_q && !plane_b_visible_q);
         if (!backdrop_color_register.y) begin
             // Half brightness
             vidout.r[7] = 0;
@@ -1238,27 +1304,27 @@ module mcd212 (
         if (transparency_control_register.mx) begin
             // No Mix. Only overlay
             if (plane_b_in_front_of_a) begin
-                if (plane_a_visible) vidout = plane_a;
-                if (plane_b_visible) vidout = plane_b;
+                if (plane_a_visible_q) vidout = plane_a_q;
+                if (plane_b_visible_q) vidout = plane_b_q;
             end else begin
-                if (plane_b_visible) vidout = plane_b;
-                if (plane_a_visible) vidout = plane_a;
+                if (plane_b_visible_q) vidout = plane_b_q;
+                if (plane_a_visible_q) vidout = plane_a_q;
             end
         end else begin
             // Perform mixing
-            if (plane_a_visible && plane_b_visible) begin
-                vidout.r = clamped_mix(plane_a.r, plane_b.r);
-                vidout.g = clamped_mix(plane_a.g, plane_b.g);
-                vidout.b = clamped_mix(plane_a.b, plane_b.b);
-            end else if (plane_a_visible) begin
-                vidout = plane_a;
-            end else if (plane_b_visible) begin
-                vidout = plane_b;
+            if (plane_a_visible_q && plane_b_visible_q) begin
+                vidout.r = clamped_mix(plane_a_q.r, plane_b_q.r);
+                vidout.g = clamped_mix(plane_a_q.g, plane_b_q.g);
+                vidout.b = clamped_mix(plane_a_q.b, plane_b_q.b);
+            end else if (plane_a_visible_q) begin
+                vidout = plane_a_q;
+            end else if (plane_b_visible_q) begin
+                vidout = plane_b_q;
             end
         end
 
-        if (debug_force_video_plane == 2'b01) vidout = plane_a;
-        else if (debug_force_video_plane == 2'b10) vidout = plane_b;
+        if (debug_force_video_plane == 2'b01) vidout = plane_a_q;
+        else if (debug_force_video_plane == 2'b10) vidout = plane_b_q;
 
         if (debug_limited_to_full == 1) begin
             vidout.r = limited_to_full1(vidout.r);
@@ -1271,7 +1337,8 @@ module mcd212 (
         end
 
         // cursor
-        if (cursor_pixel && inside_cursor_window && cursor_control_register.en) begin
+        if (cursor_pixel_q && inside_cursor_window_q && cursor_control_register.en) begin
+            backdrop_pixel = 0;
             vidout.r = cursor_color.r ? 8'hff : 0;
             vidout.g = cursor_color.g ? 8'hff : 0;
             vidout.b = cursor_color.b ? 8'hff : 0;
@@ -1283,6 +1350,11 @@ module mcd212 (
                 vidout.b[7] = 0;
             end
         end
+
+        vsd = backdrop_pixel && image_coding_method_register.ev;
+`ifdef VERILATOR
+        //vsd = 1;
+`endif
     end
 
     // Implementation of Table 5-13 Register Map
@@ -1393,9 +1465,10 @@ module mcd212 (
                         backdrop_color_register <= ch0_register_data[3:0];
                     end
                     7'h59: begin
-                        // Mosaic Pixel Hold for Plane A
-                        // TODO is ignored
-                        $display("Mosaic A %b %b", ch0_register_data[23], ch0_register_data[7:0]);
+                        // Pixel Hold for Plane A
+                        mosaic_pixel_hold_factor_register_plane_a <= ch0_register_data;
+                        `dp_raster(
+                            ("Mosaic A %b %b", ch0_register_data[23], ch0_register_data[7:0]));
                     end
                     7'h5b: begin
                         // Weight Factor for Plane A
@@ -1528,8 +1601,9 @@ module mcd212 (
                     end
                     7'h5A: begin
                         // Mosaic Pixel Hold for Plane B
-                        // TODO is ignored
-                        $display("Mosaic B %b %b", ch1_register_data[23], ch1_register_data[7:0]);
+                        mosaic_pixel_hold_factor_register_plane_b <= ch1_register_data;
+                        `dp_raster(
+                            ("Mosaic B %b %b", ch1_register_data[23], ch1_register_data[7:0]));
 
                     end
                     default: begin
@@ -1578,7 +1652,11 @@ module mcd212 (
             region_flags <= 0;
             rf0_index <= 0;
             rf1_index <= 0;
-        end else begin
+
+            // Only execute region effects when active_pixel is incrementing at the same time.
+            // To avoid repeated execution due to 30 MHz vs 15 MHz, only
+            // do it before the next hires pixel
+        end else if (!hblank_vt_q && !new_pixel_hires) begin
             if (image_coding_method_register.nr) begin
                 // Implicit Control of Regions Flags
                 // RF0 is handles by Region Control Registers 0123 in that order

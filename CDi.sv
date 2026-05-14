@@ -56,6 +56,7 @@ module emu (
     input  [11:0] HDMI_HEIGHT,
     output        HDMI_FREEZE,
     output        HDMI_BLACKOUT,
+    output        HDMI_BOB_DEINT,
 
 `ifdef MISTER_FB
     // Use framebuffer in DDRAM
@@ -117,16 +118,18 @@ module emu (
 
     //High latency DDR3 RAM interface
     //Use for non-critical time purposes
-    output        DDRAM_CLK,
-    input         DDRAM_BUSY,
-    output [ 7:0] DDRAM_BURSTCNT,
-    output [28:0] DDRAM_ADDR,
-    input  [63:0] DDRAM_DOUT,
-    input         DDRAM_DOUT_READY,
-    output        DDRAM_RD,
-    output [63:0] DDRAM_DIN,
-    output [ 7:0] DDRAM_BE,
-    output        DDRAM_WE,
+    output DDRAM_CLK,  // any clock, no restrictions. Typically main core clock
+`ifndef VERILATOR
+    input DDRAM_BUSY,  // every read and write request is only accepted in a cycle where busy is low
+    output [7:0] DDRAM_BURSTCNT,  // amount of words to be written/read. Maximum is 128
+    output [28:0] DDRAM_ADDR,         // starting address for read/write. In case of burst, the addresses will internally count up
+    input [63:0] DDRAM_DOUT,  // data coming from (burst) read
+    input         DDRAM_DOUT_READY,   // high for 1 clock cycle for every 64 bit dataword requested via (burst) read request
+    output DDRAM_RD,  // request read at DDRAM_ADDR and DDRAM_BURSTCNT length
+    output [63:0] DDRAM_DIN,  // data word to be written
+    output  [7:0] DDRAM_BE,           // byte enable for each of the 8 bytes in DDRAM_DIN, only used for writing. (1=write, 0=ignore)
+    output DDRAM_WE,  // request write at DDRAM_ADDR with DDRAM_DIN data and DDRAM_BE mask
+`endif
 
     //SDRAM interface with lower latency
     output        SDRAM_CLK,
@@ -204,13 +207,12 @@ assign USER_PP = USER_PP_DRIVE;
     assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 `endif
 
-    assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;
-
     assign VGA_SL = 0;
     assign VGA_SCALER = 0;
     assign VGA_DISABLE = 0;
     assign HDMI_FREEZE = 0;
     assign HDMI_BLACKOUT = 0;
+    assign HDMI_BOB_DEINT = 0;
 
     assign AUDIO_S = 1;
     assign AUDIO_MIX = 0;
@@ -297,12 +299,25 @@ assign USER_OUT = USER_OUT_DRIVE;
         "P2F1,ROM,Replace Boot ROM;",
         "P2O[2],Disable Audio Att.,No,Yes;",
         "P2O[3],UART Fake Space,No,Yes;",
-        "P2O[7:6],Force Video Plane,Original,A,B;",
-        "P2O[8],No reset on NvRAM change,No,Yes;",
+        "P2O[7:6],Force Video Plane,Original,A,B,DVC;",
         "P2O[12],SERVO Audio CD,No,Yes;",
-        "P2O[11],CPU Turbo,No,Yes;",
+        "P2O[17],Disable VCD pixel clock,No,Yes;",
+        "P2O[18],Activate VCD filter,Yes,No;",
+        "P2O[19],CD image live update,No,Yes;",
 
-        "O[5],Overclock input device,No,Yes;",
+        "P3,Hardware Config;",
+        "P3-;",
+        "P3O[15],Ports, P1 Front + UART Back, P1 Back + P2 Front;",
+        "P3O[5],Overclock input device,No,Yes;",
+        "P3O[13],Disable VMPEG DVC,No,Yes;",
+        "P3-;",
+        "P3-,(U) = unsafe, experimental;",
+        "P3O[16],Fast CD Seek,No,Yes(U);",
+        "P3O[11],CPU Turbo,No,Yes(U);",
+        "P3O[8],NvRAM live update,No,Yes(U);",
+
+        "-;",
+        "O[21:19],Pointer Speed,22ER9021 N,22ER9021 II,RV 8701,22ER9021 I;",
         "O[14],Autoplay,Yes,No;",
 
         // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
@@ -310,6 +325,7 @@ assign USER_OUT = USER_OUT_DRIVE;
         "O[125],UserIO Players, 1 Player,2 Players;",
         "-;",
         // [MiSTer-DB9 END]
+
 
         "-;",
         "T[0],Reset;",
@@ -332,7 +348,10 @@ assign USER_OUT = USER_OUT_DRIVE;
     wire [ 10:0] ps2_key;
 
     wire [ 15:0] JOY0_USB  /*verilator public_flat_rw*/;
+    wire [ 15:0] JOY1  /*verilator public_flat_rw*/;
     wire [ 15:0] JOY0_ANALOG  /*verilator public_flat_rw*/;
+    wire [ 15:0] JOY1_ANALOG  /*verilator public_flat_rw*/;
+
     wire [ 24:0] MOUSE  /*verilator public_flat_rw*/;
 
     wire         ioctl_download  /*verilator public_flat_rw*/;
@@ -344,7 +363,7 @@ assign USER_OUT = USER_OUT_DRIVE;
 
     wire         clk_sys  /*verilator public_flat_rw*/;
     wire         clk_audio  /*verilator public_flat_rw*/;
-
+    wire         clk_mpeg  /*verilator public_flat_rw*/;
 
     wire [ 31:0] cd_hps_lba;
     wire         cd_hps_req  /*verilator public_flat_rd*/;
@@ -354,7 +373,7 @@ assign USER_OUT = USER_OUT_DRIVE;
     wire         nvram_hps_ack  /*verilator public_flat_rw*/;
     bit          nvram_hps_wr;
     bit          nvram_hps_rd  /*verilator public_flat_rd*/;
-    bit  [ 15:0] nvram_hps_din;
+    bit  [ 15:0] nvram_hps_din  /*verilator public_flat_rd*/;
     wire         nvram_media_change  /*verilator public_flat_rw*/;
 
     wire [  7:0] sd_buff_addr  /*verilator public_flat_rw*/;
@@ -371,10 +390,19 @@ assign USER_OUT = USER_OUT_DRIVE;
 
     wire [ 64:0] hps_rtc;
 
+    // To reduce to a single clock cycle
+    bit          cd_media_change_q;
+    bit          nvram_media_change_q;
+
     // Flag which becomes active for some time when an NvRAM image is mounted
-    wire         nvram_img_mount = nvram_media_change && img_size != 0;
+    wire         nvram_img_mount = nvram_media_change && !nvram_media_change_q && img_size != 0;
     // Flag which becomes active for some time when an NvRAM image is mounted
-    wire         cd_img_mount = cd_media_change && img_size != 0;
+    wire         cd_img_mount = cd_media_change && !cd_media_change_q && img_size != 0;
+
+    always_ff @(posedge clk_sys) begin
+        cd_media_change_q <= cd_media_change;
+        nvram_media_change_q <= nvram_media_change;
+    end
 
 `ifndef VERILATOR
     hps_io #(
@@ -423,7 +451,9 @@ assign USER_OUT = USER_OUT_DRIVE;
         .ps2_mouse(MOUSE),
 
         .joystick_l_analog_0(JOY0_ANALOG),
+        .joystick_l_analog_1(JOY1_ANALOG),
         .joystick_0(JOY0_USB),  // [MiSTer-DB9] renamed for DB9/SNAC8 mux
+        .joystick_1(JOY1),
 
         // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
         // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joy_raw
@@ -459,7 +489,8 @@ assign USER_OUT = USER_OUT_DRIVE;
         .refclk(CLK_50M),
         .rst(0),
         .outclk_0(clk_sys),  // 30 MHz
-        .outclk_1(clk_audio)  // 22.2264 MHz
+        .outclk_1(clk_audio),  // 22.2264 MHz
+        .outclk_2(clk_mpeg)  // 90 MHz
     );
 `endif
 
@@ -633,9 +664,19 @@ assign USER_OUT = USER_OUT_DRIVE;
         end
     end
 
+    // Latch which is set, when CD reading was performed at least once
+    // If set, we must perform a reset when changing the disc
+    // If not set, we can change the image even with a closed tray while keeping the machine running
+    bit cd_hps_req_during_power_cycle;
+
     assign prepare_sdram = cditop_reset;
     always_ff @(posedge clk_sys) begin
-        cditop_reset <= RESET || status[0] || buttons[1] || ioctl_download || !ram_zero_done || (nvram_img_mount && enable_reset_on_nvram_img_mount);
+        cditop_reset <= RESET || status[0] || buttons[1] || ioctl_download || !ram_zero_done ||
+                (nvram_img_mount && enable_reset_on_nvram_img_mount) || 
+                (cd_img_mount && cd_hps_req_during_power_cycle && tray_is_closed && enable_reset_on_cd_img_mount);
+
+        if (cditop_reset) cd_hps_req_during_power_cycle <= 0;
+        else if (cd_hps_req) cd_hps_req_during_power_cycle <= 1;
     end
 
     sdram sdram (
@@ -656,13 +697,61 @@ assign USER_OUT = USER_OUT_DRIVE;
     );
 
 `ifdef VERILATOR
+    // DDR3 simulation
+    bit [63:0] ddram[16777216/8]  /*verilator public_flat_rd*/;
+
+    int ddr_latencycnt;
+    bit [7:0] ddr_words_to_prove;
+    bit [28:0] ddr_addr;
+
+    bit DDRAM_BUSY;  // every read and write request is only accepted in a cycle where busy is low
+    wire [7:0] DDRAM_BURSTCNT;  // amount of words to be written/read. Maximum is 128
+    wire [28:0] DDRAM_ADDR;         // starting address for read/write. In case of burst; the addresses will internally count up
+    bit [63:0] DDRAM_DOUT;  // data coming from (burst) read
+    bit         DDRAM_DOUT_READY;   // high for 1 clock cycle for every 64 bit dataword requested via (burst) read request
+    wire DDRAM_RD;  // request read at DDRAM_ADDR and DDRAM_BURSTCNT length
+    wire [63:0] DDRAM_DIN;  // data word to be written
+    wire  [7:0] DDRAM_BE;           // byte enable for each of the 8 bytes in DDRAM_DIN; only used for writing. (1=write; 0=ignore)
+    wire DDRAM_WE;  // request write at DDRAM_ADDR with DDRAM_DIN data and DDRAM_BE mask
+
+    always_ff @(posedge DDRAM_CLK) begin
+        DDRAM_DOUT_READY <= 0;
+
+        if (DDRAM_WE && !DDRAM_BUSY) begin
+            assert (DDRAM_ADDR[21] == 0);
+            ddram[DDRAM_ADDR[20:0]] <= DDRAM_DIN;
+            //$display("Write at %x %x",DDRAM_ADDR, DDRAM_DIN);
+        end
+
+        if (DDRAM_RD && !DDRAM_BUSY) begin
+            ddr_latencycnt <= 13;
+            ddr_words_to_prove <= DDRAM_BURSTCNT;
+            ddr_addr <= DDRAM_ADDR;
+            DDRAM_BUSY <= 1;
+        end
+
+        if (DDRAM_BUSY) begin
+            if (ddr_latencycnt > 0) ddr_latencycnt <= ddr_latencycnt - 1;
+            else begin
+                DDRAM_DOUT <= ddram[ddr_addr[20:0]];
+                ddr_addr <= ddr_addr + 1;
+                DDRAM_DOUT_READY <= 1;
+                ddr_words_to_prove <= ddr_words_to_prove - 1;
+                if (ddr_words_to_prove == 1) DDRAM_BUSY <= 0;
+            end
+
+        end
+    end
+
+    // SDRAM simulation
+
     bit [15:0] rom[262144]  /*verilator public_flat_rw*/;
     bit [15:0] vmpega_rom[65536]  /*verilator public_flat_rw*/;
     bit [15:0] ram[2097152]  /*verilator public_flat_rw*/;
     bit [22:0] sdram_real_addr;
     initial begin
         $readmemh("cdi200.mem", rom);
-        //$readmemh("vmpega.mem", vmpega_rom);
+        $readmemh("vmpega.mem", vmpega_rom);
         //$readmemh("ramdump.mem", ram);
     end
 
@@ -725,23 +814,43 @@ assign USER_OUT = USER_OUT_DRIVE;
     wire overclock_pointing_device = 1;
     wire [1:0] debug_force_video_plane = 0;
     wire enable_reset_on_nvram_img_mount = 0;
+    wire enable_reset_on_cd_img_mount = 0;
     wire [1:0] debug_limited_to_full = 0;
     wire audio_cd_in_tray = 0;
-    wire disable_cpu_starve = 1;
+    wire config_disable_cpu_starve = 1;
     wire config_auto_play  /*verilator public_flat_rw*/ = 1;
+    bit config_disable_vmpeg = 0;
+    wire config_first_player_back_port = 0;
+    wire config_disable_seek_time = 1;
+    wire debug_disable_vcd_clock = 0;
+    wire debug_activate_vcd_filter = 1;
+    wire [2:0] pointing_dev_speed = 0;
 `else
     // Status seems to be all zero after reset
     // Should be considered for defining the default
     wire debug_uart_fake_space = status[3];
-    wire [1:0] debug_force_video_plane = status[7:6];
     wire tvmode_ntsc = status[4];
     wire overclock_pointing_device = status[5];
+    wire [1:0] debug_force_video_plane = status[7:6];
     wire enable_reset_on_nvram_img_mount = !status[8];
+    wire enable_reset_on_cd_img_mount = !status[19];
     wire [1:0] debug_limited_to_full = status[10:9];
+    wire config_disable_cpu_starve = status[11];
     wire audio_cd_in_tray = status[12];
-    wire disable_cpu_starve = status[11];
+    bit config_disable_vmpeg = 0;
     wire config_auto_play = !status[14];
+    wire config_first_player_back_port = status[15];
+    wire config_disable_seek_time = status[16];
+    wire debug_disable_vcd_clock = status[17];
+    wire debug_activate_vcd_filter = !status[18];
+    wire [2:0] pointing_dev_speed = status[21:19];
+
+    always_ff @(posedge clk_sys) begin
+        // only change during resets
+        if (cditop_reset) config_disable_vmpeg <= status[13];
+    end
 `endif
+
     wire HBlank;
     wire HSync;
     wire VBlank;
@@ -755,14 +864,63 @@ assign USER_OUT = USER_OUT_DRIVE;
     bytestream slave_serial_in ();
     wire slave_rts;
 
+    bytestream scc68070_bypass_serial_out ();
+    bytestream scc68070_bypass_serial_in ();
+    wire scc68070_rts;
+
+    // "INPUT" port at the front of a CDI 210/05
     pointing_device pointing_dev_front (
         .clk(clk_sys),
-        .mister_joystick(JOY0),
-        .mister_joystick_analog(JOY0_ANALOG),
-        .mister_mouse(MOUSE),
+        .mister_joystick(config_first_player_back_port ? JOY1 : JOY0),
+        .mister_joystick_analog(config_first_player_back_port ? JOY1_ANALOG : JOY0_ANALOG),
+        .mister_mouse(config_first_player_back_port ? 0 : MOUSE),
         .rts(slave_rts),
         .serial_out(slave_serial_in),
-        .overclock(overclock_pointing_device)
+        .overclock(overclock_pointing_device),
+        .speed_setting(pointing_dev_speed)
+    );
+
+    // ""INPUT 2" port at the back of a CDI 210/05
+    pointing_device pointing_dev_back (
+        .clk(clk_sys),
+        .mister_joystick(config_first_player_back_port ? JOY0 : JOY1),
+        .mister_joystick_analog(config_first_player_back_port ? JOY0_ANALOG : JOY1_ANALOG),
+        .mister_mouse(config_first_player_back_port ? MOUSE : 0),
+        .rts(config_first_player_back_port ? scc68070_rts : 1'b1),
+        .serial_out(scc68070_bypass_serial_in),
+        .overclock(overclock_pointing_device),
+        .speed_setting(pointing_dev_speed)
+    );
+
+    wire cd_sector_tick;
+    wire cd_sector_delivered;
+    wire [31:0] cd_seek_lba;
+    wire cd_seek_lba_valid;
+    wire [15:0] cd_data;
+    wire cd_data_valid;
+    wire cd_stop_sector_delivery;
+
+    hps_cd_sector_cache hps_cd_sector_cache (
+        .clk(clk_sys),
+        .reset(cditop_reset),
+        .cd_hps_req(cd_hps_req),
+        .cd_hps_lba(cd_hps_lba),
+        .cd_hps_ack(cd_hps_ack),
+        .cd_hps_data_valid(sd_buff_wr && cd_hps_ack),
+        // MiSTer uses little endian on linux. Swap over to big endian
+        // to actually fit the way the 68k wants it
+        .cd_hps_data({sd_buff_dout[7:0], sd_buff_dout[15:8]}),
+
+        // Interface to CDi
+        .cd_data_valid(cd_data_valid),
+        .cd_data(cd_data),
+        .seek_lba(cd_seek_lba),
+        .stop_sector_delivery(cd_stop_sector_delivery),
+        .seek_lba_valid(cd_seek_lba_valid),
+        .sector_tick(cd_sector_tick),
+        .sector_delivered(cd_sector_delivered),
+
+        .config_disable_seek_time
     );
 
     wire fail_not_enough_words;
@@ -772,13 +930,32 @@ assign USER_OUT = USER_OUT_DRIVE;
     // TODO requires connection and testing with real photo diode
     wire rc_eye  /*verilator public_flat_rw*/;
 
+    ddr_if ddr_host ();
+
+    assign DDRAM_CLK = clk_mpeg;
+    assign DDRAM_ADDR = ddr_host.addr;
+    assign DDRAM_BE = ddr_host.byteenable;
+    assign DDRAM_WE = ddr_host.write;
+    assign DDRAM_RD = ddr_host.read;
+    assign DDRAM_DIN = ddr_host.wdata;
+    assign DDRAM_BURSTCNT = ddr_host.burstcnt;
+    assign ddr_host.rdata = DDRAM_DOUT;
+    assign ddr_host.rdata_ready = DDRAM_DOUT_READY;
+    assign ddr_host.busy = DDRAM_BUSY;
+
+    rgb888_s cdi_video_out;
+    assign {r, g, b} = {cdi_video_out.r, cdi_video_out.g, cdi_video_out.b};
+
     cditop cditop (
         .clk30(clk_sys),
         .clk_audio(clk_audio),
+        .clk_mpeg(clk_mpeg),
         .external_reset(cditop_reset),
 
         .tvmode_pal(!tvmode_ntsc),
         .debug_uart_fake_space,
+        .debug_disable_vcd_clock,
+        .debug_activate_vcd_filter,
         .debug_force_video_plane,
         .debug_limited_to_full,
         .audio_cd_in_tray,
@@ -792,9 +969,7 @@ assign USER_OUT = USER_OUT_DRIVE;
         .VSync (VSync),
         .vga_f1(VGA_F1),
 
-        .r(r),
-        .g(g),
-        .b(b),
+        .vidout(cdi_video_out),
 
         .sdram_addr(sdram_addr),
         .sdram_rd(sdram_rd),
@@ -808,6 +983,8 @@ assign USER_OUT = USER_OUT_DRIVE;
         .sdram_burstdata_valid,
         .scc68_uart_tx(UART_TXD),
         .scc68_uart_rx(UART_RXD),
+
+        .ddrif(ddr_host),
 
         .slave_worm_adr (slave_worm_adr),
         .slave_worm_data(slave_worm_data),
@@ -823,25 +1000,33 @@ assign USER_OUT = USER_OUT_DRIVE;
         .slave_serial_in(slave_serial_in),
         .slave_serial_out(slave_serial_out),
         .slave_rts(slave_rts),
+
+        .scc68070_bypass_serial_in(scc68070_bypass_serial_in),
+        .scc68070_bypass_serial_out(scc68070_bypass_serial_out),
+        .scc68070_rts(scc68070_rts),
+
         .rc_eye(rc_eye),
 
-        .cd_hps_req(cd_hps_req),
-        .cd_hps_lba(cd_hps_lba),
-        .cd_hps_ack(cd_hps_ack),
-        .cd_hps_data_valid(sd_buff_wr && cd_hps_ack),
-        // MiSTer uses little endian on linux. Swap over to big endian
-        // to actually fit the way the 68k wants it
-        .cd_hps_data({sd_buff_dout[7:0], sd_buff_dout[15:8]}),
+        .cd_seek_lba(cd_seek_lba),
+        .cd_seek_lba_valid(cd_seek_lba_valid),
+        .cd_stop_sector_delivery(cd_stop_sector_delivery),
+        .cd_data_valid(cd_data_valid),
+        .cd_data(cd_data),
+        .cd_sector_tick(cd_sector_tick),
+        .cd_sector_delivered(cd_sector_delivered),
+
         .cd_img_mount(cd_img_mount),
         .cd_img_mounted(cd_img_mounted),
+        .tray_is_closed,
 
         .audio_left (AUDIO_L),
         .audio_right(AUDIO_R),
 
         .fail_not_enough_words(fail_not_enough_words),
         .fail_too_much_data(fail_too_much_data),
-        .disable_cpu_starve,
+        .config_disable_cpu_starve,
         .config_auto_play,
+        .config_disable_vmpeg(config_disable_vmpeg),
 
         .hps_rtc(hps_rtc)
     );
@@ -849,7 +1034,10 @@ assign USER_OUT = USER_OUT_DRIVE;
 
     assign CLK_VIDEO = clk_sys;
     assign CE_PIXEL = ce_pix;
-
+`ifdef VERILATOR
+    // when the videofreak is not used.
+    assign VGA_DE = ~(HBlank | VBlank);
+`endif
     assign VGA_HS = HSync;
     assign VGA_VS = VSync;
     assign VGA_R = r;
@@ -887,6 +1075,8 @@ assign USER_OUT = USER_OUT_DRIVE;
 
     // Is set, if CD image is mounted and usable
     bit cd_img_mounted = 0;
+
+    wire tray_is_closed;
 
     // Used to detect changes of OSD_STATUS
     bit OSD_STATUS_q;

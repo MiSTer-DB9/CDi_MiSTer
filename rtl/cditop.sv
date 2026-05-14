@@ -1,10 +1,16 @@
+`include "videotypes.svh"
+`include "mpeg/util.svh"
 
 module cditop (
     input clk30,
     input clk_audio,
+    input clk_mpeg,
     input external_reset,
 
     input tvmode_pal,
+
+    input debug_disable_vcd_clock,
+    input debug_activate_vcd_filter,
     input debug_uart_fake_space,
     input [1:0] debug_force_video_plane,
     input [1:0] debug_limited_to_full,
@@ -18,9 +24,7 @@ module cditop (
     output bit VSync,
     output vga_f1,
 
-    output [7:0] r,
-    output [7:0] g,
-    output [7:0] b,
+    output rgb888_s vidout,
 
     output [24:0] sdram_addr,
     output        sdram_rd,
@@ -32,6 +36,8 @@ module cditop (
     output        sdram_burst,
     output        sdram_refresh,
     input         sdram_burstdata_valid,
+
+    ddr_if.to_host ddrif,
 
     output scc68_uart_tx,
     input  scc68_uart_rx,
@@ -49,25 +55,34 @@ module cditop (
 
     bytestream.source slave_serial_out,
     bytestream.sink slave_serial_in,
-    input rc_eye,
     output slave_rts,
+    input rc_eye,
 
-    output [31:0] cd_hps_lba,
-    output cd_hps_req,
-    input cd_hps_ack,
-    input cd_hps_data_valid,
-    input [15:0] cd_hps_data,
-    input cd_img_mount,
-    input cd_img_mounted,
+    bytestream.source scc68070_bypass_serial_out,
+    bytestream.sink scc68070_bypass_serial_in,
+    output scc68070_rts,
+
+    // IO for CD data
+    output bit [31:0] cd_seek_lba,
+    output bit cd_seek_lba_valid,
+    input [15:0] cd_data,
+    input cd_data_valid,
+    output cd_sector_tick,
+    input cd_sector_delivered,
+    output cd_stop_sector_delivery,
+
+    input  cd_img_mount,
+    input  cd_img_mounted,
+    output tray_is_closed,
 
     output signed [15:0] audio_left,
     output signed [15:0] audio_right,
 
     output fail_not_enough_words,
     output fail_too_much_data,
-    input  disable_cpu_starve,
-    input  config_auto_play,
-
+    input config_disable_cpu_starve,
+    input config_auto_play,
+    input config_disable_vmpeg,
     input [64:0] hps_rtc
 );
 
@@ -75,29 +90,33 @@ module cditop (
 
     parallelel_spi slave_servo_spi ();
 
-    wire write_strobe;
-    wire as;
-    wire lds;
-    wire uds;
+    wire write_strobe  /*verilator public_flat_rd*/;
+    wire as  /*verilator public_flat_rd*/;
+    wire lds  /*verilator public_flat_rd*/;
+    wire uds  /*verilator public_flat_rd*/;
 
     bit bus_ack  /*verilator public_flat_rd*/;
 
     bit [15:0] data_in;
     wire [15:0] cpu_data_out;
     wire [23:1] addr;
-    wire [23:0] addr_byte = {addr[23:1], 1'b0};
+    wire [23:0] addr_byte  /*verilator public_flat_rd*/ = {addr[23:1], 1'b0};
 
-    wire [15:0] cpu_data = write_strobe ? cpu_data_out : data_in;
+    wire [15:0] cpu_data  /*verilator public_flat_rd*/ = write_strobe ? cpu_data_out : data_in;
 
     wire mcd212_bus_ack;
     bit cdic_bus_ack;
+    bit vmpeg_bus_ack;
     bit mk48_bus_ack;
     wire [15:0] mcd212_dout;
     wire [15:0] cdic_dout;
+    wire [15:0] vmpeg_dout;
     wire [7:0] mk48_dout;
 
     wire attex_cs_mcd212 = ((addr_byte <= 24'h27ffff) || (addr_byte >= 24'h400000)) && as && !addr[23];
     wire dvc_ram_cs = ((addr_byte[23:20] == 4'hd) || (addr_byte[23:19] == 5'b11101)) && as;
+    wire dvc_rom_cs = (addr_byte[23:18] == 6'b111001) && as;
+    wire dvc_mpeg_cs = (addr_byte[23:18] == 6'b111000) && as && !config_disable_vmpeg;
     wire attex_cs_cdic = addr_byte[23:16] == 8'h30 && as;
     wire attex_cs_slave = addr_byte[23:16] == 8'h31 && as;
     wire attex_cs_mk48 = addr_byte[23:16] == 8'h32 && as;
@@ -131,7 +150,8 @@ module cditop (
     wire bus_err_ram_area2 = (addr_byte >= 24'h500000 && addr_byte < 24'hd00000);
     wire bus_err_ram_area3 = (addr_byte >= 24'hf10000);
     wire bus_err_ram_area4 = (addr_byte >= 24'hf00000) && !playcdi_rom_activated;
-    wire bus_err = (bus_err_ram_area1 || bus_err_ram_area2 || bus_err_ram_area3 || bus_err_ram_area4) && as && (lds || uds);
+    wire bus_err_ram_area5 = (addr_byte[23:19] == 5'b11101) && !mpeg_ram_enabled; // MPEG RAM cannot be accessed at first
+    wire bus_err = (bus_err_ram_area1 || bus_err_ram_area2 || bus_err_ram_area3 || bus_err_ram_area4 || bus_err_ram_area5) && as && (lds || uds);
 
     always_ff @(posedge clk30) begin
 
@@ -157,15 +177,10 @@ module cditop (
 
 
             if ((lds || uds) && attex_cs_mk48)
-                $display(
-                    "Access NVRAM %x %x %x %d %d %d",
-                    addr[7:1],
-                    data_in,
-                    cpu_data_out,
-                    lds,
-                    uds,
-                    write_strobe
-                );
+
+                if (write_strobe)
+                    $display("Write NVRAM %x %x %d%d", addr[7:1], cpu_data_out, lds, uds);
+                else $display("Read NVRAM %x %x %d%d", addr[7:1], data_in, lds, uds);
 
         end
     end
@@ -193,6 +208,12 @@ module cditop (
 
     wire vdsc_int  /*verilator public_flat_rd*/;
 
+    // VSD is set if EV-bit is set and the backdrop is shown
+    // A real CDI 210/05 uses VSA because of analog
+    // video mixing. But we won't do that here and use the digital
+    // one instead
+    wire mcd212_vsd;
+
     mcd212 mcd212_inst (
         .clk(clk30),
         .reset,
@@ -205,9 +226,9 @@ module cditop (
         .cpu_write_strobe(write_strobe),
         .cs(attex_cs_mcd212),
         .dvc_ram_cs(dvc_ram_cs),
-        .r(r),
-        .g(g),
-        .b(b),
+        .dvc_rom_cs(dvc_rom_cs),
+        .vidout(mcd212_video_out),
+        .vsd(mcd212_vsd),
         .hsync(HSync),
         .vsync(VSync),
         .hblank(HBlank),
@@ -227,24 +248,53 @@ module cditop (
         .debug_force_video_plane,
         .debug_limited_to_full,
         // Don't starve the CPU during DMA transfers
-        .disable_cpu_starve(disable_cpu_starve || cdic_dma_ack || cdic_dma_req)
+        .disable_cpu_starve(config_disable_cpu_starve || cdic_dma_ack || cdic_dma_req)
     );
+
+
+    // DMA signals from CPU
+    wire vmpeg_dma_ack;
+    wire cdic_dma_ack;
+    wire dma_dtc;
+    wire dma_done_out;
+
+    // DMA signals to CPU
+    wire cdic_dma_req;
+    wire vmpeg_dma_req;
+    wire vmpeg_dma_rdy;
+    wire cdic_dma_rdy;
 
     wire in2in  /*verilator public_flat_rd*/;
     wire in4in;
     wire iack2;
     wire iack4;
     wire iack5;
-    wire cdic_dma_req;
-    wire cdic_dma_ack;
-    wire cdic_dma_rdy;
-    wire cdic_dma_dtc;
+
     wire cdic_dma_done_in;
-    wire cdic_dma_done_out;
 
     wire signed [15:0] cdic_audio_left;
     wire signed [15:0] cdic_audio_right;
 
+    wire signed [15:0] mpeg_audio_left;
+    wire signed [15:0] mpeg_audio_right;
+
+    wire sample_tick37;
+    wire sample_tick44  /*verilator public_flat_rd*/;
+    wire mpeg_45tick;
+
+    cdic_clock_gen cdic_clk_gen (
+        .clk(clk30),
+        .clk_audio(clk_audio),
+        .reset,
+        .sector_tick(cd_sector_tick),
+        .sample_tick37,
+        .sample_tick44,
+        .mpeg_45tick
+    );
+
+    wire cdic_intreq;
+    wire cdic_intack;
+    /*verilator tracing_off*/
     cdic cdic_inst (
         .clk(clk30),
         .clk_audio(clk_audio),
@@ -257,29 +307,87 @@ module cditop (
         .write_strobe(write_strobe),
         .cs(attex_cs_cdic),
         .bus_ack(cdic_bus_ack),
-        .intreq(in4in),
-        .intack(iack4),
+        .intreq(cdic_intreq),
+        .intack(cdic_intack),
         .req(cdic_dma_req),
         .ack(cdic_dma_ack),
         .rdy(cdic_dma_rdy),
-        .dtc(cdic_dma_dtc),
-        .done_in(cdic_dma_done_out),
+        .dtc(dma_dtc),
+        .done_in(dma_done_out),
         .done_out(cdic_dma_done_in),
-        .cd_hps_lba(cd_hps_lba),
-        .cd_hps_req(cd_hps_req),
-        .cd_hps_ack,
-        .cd_hps_data_valid,
-        .cd_hps_data,
+        .cd_seek_lba,
+        .cd_seek_lba_valid,
+        .cd_data_valid,
+        .cd_data,
+        .cd_sector_tick,
+        .cd_sector_delivered,
+        .cd_stop_sector_delivery,
         .audio_left(cdic_audio_left),
         .audio_right(cdic_audio_right),
+        .sample_tick37,
+        .sample_tick44,
         .fail_not_enough_words(fail_not_enough_words),
         .fail_too_much_data(fail_too_much_data)
     );
+    /*verilator tracing_on*/
 
     // TODO might not be correct
     // CDIC seems to want manual vector
     // For the SLAVE we must use autovectoring
     wire av = iack2;
+
+    wire mpeg_ram_enabled;
+
+    wire vmpeg_intreq;
+    wire vmpeg_intack;
+
+    rgb888_s fmv_video_out;
+    rgb888_s mcd212_video_out;
+    wire debug_video_fifo_overflow;
+    wire debug_audio_fifo_overflow;
+    linear_volume_s mpeg_dsp_volume;
+
+    vmpeg vmpeg_inst (
+        .clk(clk30),
+        .clk_mpeg,
+        .reset,
+        .tvmode_pal,
+        .address(addr),
+        .din(vmpeg_dma_ack ? mcd212_dout : cpu_data_out),
+        .dout(vmpeg_dout),
+        .uds(uds),
+        .lds(lds),
+        .write_strobe(write_strobe),
+        .cs(dvc_mpeg_cs),
+        .bus_ack(vmpeg_bus_ack),
+        .intreq(vmpeg_intreq),
+        .intack(vmpeg_intack),
+        .req(vmpeg_dma_req),
+        .ack(vmpeg_dma_ack),
+        .rdy(vmpeg_dma_rdy),
+        .dtc(dma_dtc),
+        .done_in(dma_done_out),
+        .done_out(),
+        .debug_disable_vcd_clock,
+        .debug_activate_vcd_filter,
+        .mpeg_ram_enabled(mpeg_ram_enabled),
+        .debug_video_fifo_overflow(debug_video_fifo_overflow),
+        .debug_audio_fifo_overflow(debug_audio_fifo_overflow),
+        .hsync(HSync),
+        .vsync(VSync),
+        .hblank(HBlank),
+        .vblank(VBlank),
+        .vidout(fmv_video_out),
+        .audio_left(mpeg_audio_left),
+        .audio_right(mpeg_audio_right),
+        .sample_tick44,
+        .clk45tick(mpeg_45tick),
+        .dsp_volume(mpeg_dsp_volume),
+        .ddrif
+    );
+
+    wire force_dvc_video = debug_force_video_plane == 2'b11;
+    assign vidout = (mcd212_vsd || force_dvc_video) ? fmv_video_out : mcd212_video_out;
 
 `ifndef DISABLE_MAIN_CPU
     wire reset68k;
@@ -290,14 +398,20 @@ module cditop (
     // This reset delay of 8 frames ensures
     // that the slave has enough time to react
     // It will result into 160 polls until the answer is available
+
+`ifdef VERILATOR
+    // For simulation, we are fine because of a hack in uc_68hc05.sv
+    assign reset68k = reset;
+`else
     resetdelay cpuresetdelay (
         .clk(clk30),
         .reset,
         .vsync(VSync),
         .delayedreset(reset68k)
     );
-    /*verilator tracing_off*/
+`endif
 
+    /*verilator tracing_off*/
     scc68070 scc68070_0 (
         .clk(clk30),
         .reset(reset68k),  // External sync reset on emulated system
@@ -321,17 +435,19 @@ module cditop (
         .addr(addr),
         .uart_tx(scc68_uart_tx),
         .uart_rx(scc68_uart_rx),
+        .bypass_uart_rx(scc68070_bypass_serial_in),
+        .bypass_uart_rts(scc68070_rts),
         .debug_uart_fake_space,
         .req1(cdic_dma_req),
-        .req2(0),
+        .req2(vmpeg_dma_req),
         .ack1(cdic_dma_ack),
-        .ack2(),
-        .rdy(cdic_dma_rdy),
-        .dtc(cdic_dma_dtc),
+        .ack2(vmpeg_dma_ack),
+        .rdy(cdic_dma_rdy || vmpeg_dma_rdy),
+        .dtc(dma_dtc),
         .done_in(cdic_dma_done_in),
-        .done_out(cdic_dma_done_out)
+        .done_out(dma_done_out)
     );
-    /*verilator tracing_on*/
+    /*verilator tracing_on */
 
 `endif
 
@@ -362,10 +478,13 @@ module cditop (
         end else if (attex_cs_cdic) begin
             data_in = cdic_dout;
             bus_ack = cdic_bus_ack;
+        end else if (dvc_mpeg_cs) begin
+            data_in = vmpeg_dout;
+            bus_ack = vmpeg_bus_ack;
         end else if (attex_cs_mk48) begin
             data_in = {mk48_dout, mk48_dout};
             bus_ack = mk48_bus_ack;
-        end else if (attex_cs_mcd212 || dvc_ram_cs) begin
+        end else if (attex_cs_mcd212 || dvc_ram_cs || dvc_rom_cs) begin
             data_in = mcd212_dout;
             bus_ack = mcd212_bus_ack;
         end else if (rom_playcdi_cs && playcdi_rom_activated) begin
@@ -373,8 +492,13 @@ module cditop (
             bus_ack = rom_playcdi_bus_ack;
         end
 
-        if (iack4) begin
+        if (cdic_intack) begin
             data_in = cdic_dout;
+            bus_ack = 1;
+        end
+
+        if (vmpeg_intack) begin
+            data_in = vmpeg_dout;
             bus_ack = 1;
         end
     end
@@ -448,10 +572,12 @@ module cditop (
         .csdac2n(csdac2n),
         .csdac1n(csdac1n),
         .clkdac(clkdac),
-
-        .audio_left_in  (cdic_audio_left),
-        .audio_right_in (cdic_audio_right),
-        .audio_left_out (att_audio_left),
+        .mpeg_volume(mpeg_dsp_volume),
+        .audio_left_in(cdic_audio_left),
+        .audio_right_in(cdic_audio_right),
+        .mpeg_left_in(mpeg_audio_left),
+        .mpeg_right_in(mpeg_audio_right),
+        .audio_left_out(att_audio_left),
         .audio_right_out(att_audio_right)
     );
 
@@ -472,7 +598,8 @@ module cditop (
         .quirk_force_mode_fault(quirk_force_mode_fault),
         .audio_cd_in_tray,
         .cd_img_mount(cd_img_mount),
-        .cd_img_mounted(cd_img_mounted)
+        .cd_img_mounted(cd_img_mounted),
+        .tray_is_closed
     );
 
     always_comb begin
@@ -495,6 +622,277 @@ module cditop (
         end
 
     end
+
+    // Inspired by a small 74ACT74 SR flip flop which does this in the real machine
+    enum bit [1:0] {
+        IDLE,
+        CDIC,
+        VMPEG
+    } irq_in4owner;
+
+    assign cdic_intack = iack4 && irq_in4owner == CDIC;
+    assign vmpeg_intack = iack4 && irq_in4owner == VMPEG;
+    assign in4in = ((irq_in4owner == CDIC) && cdic_intreq) ||  ((irq_in4owner == VMPEG) && vmpeg_intreq);
+
+    always_ff @(posedge clk30) begin
+        case (irq_in4owner)
+            CDIC: begin
+                if (!cdic_intreq) irq_in4owner <= IDLE;
+            end
+            VMPEG: begin
+                if (!vmpeg_intreq) irq_in4owner <= IDLE;
+            end
+            default: begin
+                if (cdic_intreq) irq_in4owner <= CDIC;
+                if (vmpeg_intreq) irq_in4owner <= VMPEG;
+            end
+        endcase
+    end
+
+
+`ifdef VERILATOR
+    // Only for gtkwave to align video images with the signals in the waveform
+    int frame_index  /*verilator public_flat_rw*/;
+
+    // Tool to observe variables in madriv module
+    struct {
+        bit [31:0] dma_addr;    // 0x122
+        bit [15:0] irq_stat;    // 0x120
+        bit [15:0] irq_enable;  // 0x150
+    } madriv = '{default: 0};
+    bit [23:0] madriv_static  /*verilator public_flat_rw*/ = 24'hdfb770;
+
+    always @(posedge clk30) begin
+        if (madriv_static != 0 && bus_ack && write_strobe) begin
+            if (addr_byte == madriv_static + 24'h122) begin
+                madriv.dma_addr[31:16] = cpu_data;
+                $display("dma_addr = %x", {cpu_data, madriv.dma_addr[15:0]});
+            end
+
+            if (addr_byte == madriv_static + 24'h124) begin
+                madriv.dma_addr[15:0] = cpu_data;
+                $display("dma_addr = %x", {madriv.dma_addr[31:16], cpu_data});
+            end
+
+            if (addr_byte == madriv_static + 24'h0150) begin
+                madriv.irq_stat = cpu_data;
+                $display("irq_stat = %x", cpu_data);
+            end
+
+            if (addr_byte == madriv_static + 24'h0120) begin
+                madriv.irq_enable = cpu_data;
+                $display("irq_enable = %x", cpu_data);
+            end
+        end
+    end
+
+    // Tool to observe variables in fdrvs1 module
+    struct {
+        bit [7:0] V_StepDone; // 0x17a char*
+        bit [7:0] V_BufStat;  // 0x17b char*
+        bit [7:0] V_UpdFlag;  // 0x12e char*
+        bit [15:0] V_Stat;    // 0x134
+        bit [15:0] V_VCMD;    // 0x16c
+        bit [15:0] V_Scroll;  // 0x16a
+        bit [15:0] V_DTSVal;  // 0x1c0
+        bit [31:0] V_SCR;     // 0xca
+        bit [15:0] V_Status;  // 0x136
+        bit [15:0] V_SigStat; // 0x13c
+        bit [15:0] V_AsyStat; // 0x16e
+        bit [31:0] V_Window;  // 0xe6
+        bit [31:0] V_DecOff;  // 0xea
+        bit [31:0] V_ScrOrg;  // 0xee
+        bit [31:0] V_ScrOff;  // 0xf2
+        bit [31:0] V_NISFnd;  // 0x170
+        bit [7:0]  V_PicRt; // 0x0x17f char*
+        bit [31:0] V_PWI; // 0x180
+        bit [15:0] V_PRPA; //0x194
+        bit [31:0] V_Speed; // 0x100
+        bit [15:0] V_PlayType; // 0x9a
+        bit [7:0] V_Sync;  // 0xc9 char*
+        bit [7:0] V_SyncDone;  // 0x12c char*
+        bit [15:0] V_LCntr;  // 0xac
+        bit [7:0] V_Frozen;  // 0xde char*
+        bit [31:0] V_PausedSCR; // 0x144
+    } fdrvs1 = '{default: 0};
+    bit [23:0] fdrvs1_static  /*verilator public_flat_rw*/ = 24'hdfb180;
+    always @(posedge clk30) begin
+
+        if (fdrvs1_static != 0 && bus_ack && write_strobe) begin
+
+            if (addr_byte == fdrvs1_static + 24'h0136) begin
+                fdrvs1.V_Status = cpu_data;
+                $display("V_Status = %d dez", cpu_data);
+            end
+            if (addr_byte == fdrvs1_static + 24'h013c) begin
+                fdrvs1.V_SigStat = cpu_data;
+                $display("V_SigStat = %d dez", cpu_data);
+            end
+            if (addr_byte == fdrvs1_static + 24'h016e) begin
+                fdrvs1.V_AsyStat = cpu_data;
+                $display("V_AsyStat = %x hex %d dez", cpu_data, cpu_data);
+            end
+            if (addr_byte == fdrvs1_static + 24'h0134) begin
+                fdrvs1.V_Stat = cpu_data;
+                $display("V_Stat = %d dez", cpu_data);
+            end
+            if (addr_byte == fdrvs1_static + 24'h0194) begin
+                fdrvs1.V_PRPA = cpu_data;
+                $display("V_PRPA = %d dez", cpu_data);
+            end
+            if (addr_byte == fdrvs1_static + 24'h009a) begin
+                fdrvs1.V_PlayType = cpu_data;
+                $display("V_PlayType = %d dez", cpu_data);
+            end
+
+            // I assume that fdrvs1_static is always aligned to words
+            if (addr_byte == fdrvs1_static + 24'h017a && uds) begin  // Location is 0x17a -> high byte
+                fdrvs1.V_StepDone = cpu_data[15:8];
+                $display("V_StepDone = %d dez", cpu_data[15:8]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h017a && lds) begin  // Location is 0x17b -> low byte
+                fdrvs1.V_BufStat = cpu_data[7:0];
+                $display("V_BufStat = %d dez", cpu_data[7:0]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h012e && uds) begin  // Location is 0x12e -> high byte
+                fdrvs1.V_UpdFlag = cpu_data[15:8];
+                $display("V_UpdFlag = %d dez", cpu_data[15:8]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h017e && lds) begin  // Location is 0x17f -> low byte
+                fdrvs1.V_PicRt = cpu_data[7:0];
+                $display("V_PicRt = %d dez", cpu_data[7:0]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h00c8 && lds) begin  // Location is 0xc9 -> low byte
+                fdrvs1.V_Sync = cpu_data[7:0];
+                $display("V_Sync = %d dez", cpu_data[7:0]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h012c && uds) begin  // Location is 0x12c -> high byte
+                fdrvs1.V_SyncDone = cpu_data[7:0];
+                $display("V_SyncDone = %d dez", cpu_data[7:0]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0de && uds) begin  // Location is 0xde -> high byte
+                fdrvs1.V_Frozen = cpu_data[7:0];
+                $display("V_Frozen = %d dez", cpu_data[7:0]);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h00ac) begin
+                fdrvs1.V_LCntr = cpu_data;
+                $display("V_LCntr = %x", cpu_data);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h016a) begin
+                fdrvs1.V_Scroll = cpu_data;
+                $display("V_Scroll = %x", cpu_data);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h016c) begin
+                fdrvs1.V_VCMD = cpu_data;
+                $display("V_VCMD = %x", cpu_data);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h01c0) begin
+                fdrvs1.V_DTSVal = cpu_data;
+                $display("V_DTSVal = %x", cpu_data);
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0ca) begin
+                fdrvs1.V_SCR[31:16] = cpu_data;
+                $display("V_SCR = %x", {cpu_data, fdrvs1.V_SCR[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0cc) begin
+                fdrvs1.V_SCR[15:0] = cpu_data;
+                $display("V_SCR = %x", {fdrvs1.V_SCR[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0e6) begin
+                fdrvs1.V_Window[31:16] = cpu_data;
+                $display("V_Window = %x", {cpu_data, fdrvs1.V_Window[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0e8) begin
+                fdrvs1.V_Window[15:0] = cpu_data;
+                $display("V_Window = %x", {fdrvs1.V_Window[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0ea) begin
+                fdrvs1.V_DecOff[31:16] = cpu_data;
+                $display("V_DecOff = %x", {cpu_data, fdrvs1.V_DecOff[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0ec) begin
+                fdrvs1.V_DecOff[15:0] = cpu_data;
+                $display("V_DecOff = %x", {fdrvs1.V_DecOff[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0ee) begin
+                fdrvs1.V_ScrOrg[31:16] = cpu_data;
+                $display("V_ScrOrg = %x", {cpu_data, fdrvs1.V_ScrOrg[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0f0) begin
+                fdrvs1.V_ScrOrg[15:0] = cpu_data;
+                $display("V_ScrOrg = %x", {fdrvs1.V_ScrOrg[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0f2) begin
+                fdrvs1.V_ScrOff[31:16] = cpu_data;
+                $display("V_ScrOff = %x", {cpu_data, fdrvs1.V_ScrOff[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h0f4) begin
+                fdrvs1.V_ScrOff[15:0] = cpu_data;
+                $display("V_ScrOff = %x", {fdrvs1.V_ScrOff[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h170) begin
+                fdrvs1.V_NISFnd[31:16] = cpu_data;
+                $display("V_NISFnd = %x", {cpu_data, fdrvs1.V_NISFnd[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h172) begin
+                fdrvs1.V_NISFnd[15:0] = cpu_data;
+                $display("V_NISFnd = %x", {fdrvs1.V_NISFnd[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h180) begin
+                fdrvs1.V_PWI[31:16] = cpu_data;
+                $display("V_PWI = %x", {cpu_data, fdrvs1.V_PWI[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h182) begin
+                fdrvs1.V_PWI[15:0] = cpu_data;
+                $display("V_PWI = %x", {fdrvs1.V_PWI[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h100) begin
+                fdrvs1.V_Speed[31:16] = cpu_data;
+                $display("V_Speed = %x", {cpu_data, fdrvs1.V_Speed[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h102) begin
+                fdrvs1.V_Speed[15:0] = cpu_data;
+                $display("V_Speed = %x", {fdrvs1.V_Speed[31:16], cpu_data});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h144) begin
+                fdrvs1.V_PausedSCR[31:16] = cpu_data;
+                $display("V_PausedSCR = %x", {cpu_data, fdrvs1.V_PausedSCR[15:0]});
+            end
+
+            if (addr_byte == fdrvs1_static + 24'h146) begin
+                fdrvs1.V_PausedSCR[15:0] = cpu_data;
+                $display("V_PausedSCR = %x", {fdrvs1.V_PausedSCR[31:16], cpu_data});
+            end
+        end
+    end
+`endif
 
 endmodule
 
