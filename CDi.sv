@@ -302,7 +302,7 @@ assign USER_OUT = USER_OUT_DRIVE;
     // Direct mapping: [3:0]=UDLR, [4]=A/B1, [5]=B/B2, [6]=C/B1+B2
     // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joystick mux with OSD guard
     wire [15:0] JOY0 = joydb_1ena ?
-        (OSD_STATUS ? 16'b0 : {9'b0, joydb_1[6:4], joydb_1[3:0]})
+        (OSD_STATUS ? 16'b0 : joydb_1_mapped[6:0])
         : JOY0_USB;
     // [MiSTer-DB9 END]
 
