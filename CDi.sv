@@ -249,7 +249,7 @@ wire  [15:0] joy_raw_payload;
 // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: probe-gating wires
 // SNAC cores: replace 1'b0 with the core's SNAC enable expression so SNAC
 // preempts the joydb wrapper on shared USER_IO pins. Default 1'b0 is no-op.
-wire         snac_active     = 1'b0;
+wire         snac_active     = snac_enable_split_port | snac_enable_infrared;
 // MT32-pi probe-suppression gate. Auto-detected from MT32 signals declared
 // elsewhere in this file (mt32_disable / mt32_use / mt32_on_primary). Hand-edit
 // if the heuristic missed your core's gate expression. Suppresses the OSD-open
@@ -290,7 +290,7 @@ joydb joydb (
   .joy_raw         ( joy_raw_payload )
 );
 
-assign USER_OUT = USER_OUT_DRIVE;
+assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by the SNAC-priority fall-through block below
 // [MiSTer-DB9 END]
 
 
@@ -967,13 +967,18 @@ assign USER_OUT = USER_OUT_DRIVE;
 
     // Comments represent the USB 3.0 signal name
     // together with the split port name
-    assign USER_OUT[0] = 1;  // D+, RXD2
-    assign USER_OUT[1] = 1;  // D-, RXD1
-    assign USER_OUT[2] = 1;  // TX-, CTS1
-    assign USER_OUT[3] = 1;  // GND DRAIN, RTS1
-    assign USER_OUT[4] = ~(slave_rts | forced_snac_rts);  // RX+, RTS2
-    assign USER_OUT[5] = 1;  // RX-, TXD1
-    assign USER_OUT[6] = 1;  // TX+, RC-Eye
+    // [MiSTer-DB9 BEGIN] - SNAC-priority: drive native CDi serial peripheral
+    // pins only when a CDi peripheral is selected (snac_active); otherwise the
+    // pins fall through to the joydb wrapper output (USER_OUT_DRIVE) so DB9MD/
+    // DB15/Saturn + the OSD-open autodetect probe still work.
+    assign USER_OUT[0] = snac_active ? 1'b1 : USER_OUT_DRIVE[0];  // D+, RXD2
+    assign USER_OUT[1] = snac_active ? 1'b1 : USER_OUT_DRIVE[1];  // D-, RXD1
+    assign USER_OUT[2] = snac_active ? 1'b1 : USER_OUT_DRIVE[2];  // TX-, CTS1
+    assign USER_OUT[3] = snac_active ? 1'b1 : USER_OUT_DRIVE[3];  // GND DRAIN, RTS1
+    assign USER_OUT[4] = snac_active ? ~(slave_rts | forced_snac_rts) : USER_OUT_DRIVE[4];  // RX+, RTS2
+    assign USER_OUT[5] = snac_active ? 1'b1 : USER_OUT_DRIVE[5];  // RX-, TXD1
+    assign USER_OUT[6] = snac_active ? 1'b1 : USER_OUT_DRIVE[6];  // TX+, RC-Eye
+    // [MiSTer-DB9 END]
 
     rts_forcer rtsforcer (
         .clk(clk_sys),
