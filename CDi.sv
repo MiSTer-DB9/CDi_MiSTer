@@ -27,7 +27,7 @@ module emu (
     input RESET,
 
     //Must be passed to hps_io module
-    inout [48:0] HPS_BUS,
+    inout [45:0] HPS_BUS,
 
     //Base video clock. Usually equals to CLK_SYS.
     output CLK_VIDEO,
@@ -350,7 +350,9 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         "O[14],Autoplay,Yes,No;",
 
         // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support
+        // [MiSTer-DB9-Pro BEGIN] - Saturn-first joy_type (canonical bit notation; 1P-only)
         "O[127:126],UserIO Joystick,Off,Saturn,DB9MD,DB15;",
+        // [MiSTer-DB9-Pro END]
         "-;",
         // [MiSTer-DB9 END]
 
