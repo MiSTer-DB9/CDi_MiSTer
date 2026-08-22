@@ -17,6 +17,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <png.h>
 
 #include "crc.h"
 #include "hle.h"
@@ -32,6 +33,8 @@
 #define SLAVE
 // #define TRACE
 // #define SIMULATE_RC5
+// #define TRACE_ON_FMA
+// #define TRACE_ON_FMV
 
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg_pc.h"
@@ -116,6 +119,37 @@ int WriteRgbBmp(const char *path, int width, int height, int vertical_scale, con
     }
     fclose(fh);
     return file_size;
+}
+
+// Writes the simulator's RGB framebuffer as a vertically scaled PNG.
+int WriteRgbPng(const char *path, int width, int height, int vertical_scale, const uint8_t *pixels) {
+    FILE *file = fopen(path, "wb");
+    if (!file)
+        return 0;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+    if (!png || !info || setjmp(png_jmpbuf(png))) {
+        if (png)
+            png_destroy_write_struct(&png, info ? &info : nullptr);
+        fclose(file);
+        return 0;
+    }
+
+    const int output_height = height * vertical_scale;
+    png_init_io(png, file);
+    png_set_IHDR(png, info, width, output_height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    std::vector<png_bytep> rows(output_height);
+    for (int row = 0; row < output_height; row++)
+        rows[row] = const_cast<png_bytep>(pixels + (row / vertical_scale) * width * 3);
+    png_write_image(png, rows.data());
+    png_write_end(png, nullptr);
+    png_destroy_write_struct(&png, &info);
+    fclose(file);
+    return 1;
 }
 
 typedef struct {
@@ -378,6 +412,10 @@ class CDi {
     int frame_index = 0;
     int fmv_frame_cnt{0};
 
+    void EnablePngFrames() {
+        write_png_frames = true;
+    }
+
   private:
     FILE *f_audio_left{nullptr};
     FILE *f_audio_right{nullptr};
@@ -387,6 +425,7 @@ class CDi {
     FILE *f_fmv{nullptr};
     FILE *f_fmv_m1v{nullptr};
     FILE *f_executed_events{nullptr};
+    bool write_png_frames{false};
 
     int fmv_index{0};
     /// @brief Used to decide whether a new index must be created
@@ -413,7 +452,17 @@ class CDi {
     bool executing_dvc_rom_instructions{false};
 
     int instanceid;
-    enum class InputKind { Button1, Button2, Buttons1And2, Analog, TraceOn, TraceOff, InstructionsOn, InstructionsOff, Quit };
+    enum class InputKind {
+        Button1,
+        Button2,
+        Buttons1And2,
+        Analog,
+        TraceOn,
+        TraceOff,
+        InstructionsOn,
+        InstructionsOff,
+        Quit
+    };
     struct InputEvent {
         uint64_t frame;
         InputKind kind;
@@ -915,18 +964,21 @@ class CDi {
             case InputKind::Button1:
             case InputKind::Button2:
             case InputKind::Buttons1And2: {
-                const unsigned int buttons = event.kind == InputKind::Button1 ? 1u
+                const unsigned int buttons = event.kind == InputKind::Button1   ? 1u
                                              : event.kind == InputKind::Button2 ? 2u
-                                                                              : 3u;
+                                                                                : 3u;
                 held_buttons |= buttons;
                 for (unsigned int button = 0; button < 2; button++) {
                     if (buttons & (1u << button)) {
-                        button_release_frame[button] = std::max(
-                            button_release_frame[button], static_cast<uint64_t>(frame_index) + event.hold_frames);
+                        button_release_frame[button] = std::max(button_release_frame[button],
+                                                                static_cast<uint64_t>(frame_index) + event.hold_frames);
                     }
                 }
                 fprintf(stderr, "Press Button%s%s at frame %d\n", buttons & 1 ? " 1" : "",
-                        buttons == 3 ? " + 2" : buttons & 2 ? " 2" : "", frame_index);
+                        buttons == 3  ? " + 2"
+                        : buttons & 2 ? " 2"
+                                      : "",
+                        frame_index);
                 break;
             }
             case InputKind::Analog:
@@ -1369,10 +1421,11 @@ class CDi {
                 std::chrono::duration<double> elapsed_seconds_since_last_frame = current - last_frame_time;
                 last_frame_time = current;
 
-                sprintf(filename, "%d/video_%03d.bmp", instanceid, frame_index);
-                if (!WriteRgbBmp(filename, width, height, 4, output_image))
+                sprintf(filename, "%d/video_%03d.%s", instanceid, frame_index, write_png_frames ? "png" : "bmp");
+                if (write_png_frames ? !WriteRgbPng(filename, width, height, 4, output_image)
+                                     : !WriteRgbBmp(filename, width, height, 4, output_image))
                     abort();
-                printf("Written video_%03d.bmp\n", frame_index);
+                printf("Written video_%03d.%s\n", frame_index, write_png_frames ? "png" : "bmp");
                 // printf("We are at time30mhz=%ld\n", time30mhz);
 
                 uint32_t mpeg_frequency = mpeg_clk_calc_ticks * 30 / mpeg_clk_calc_ticks30;
@@ -1476,7 +1529,12 @@ class CDi {
             if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fmv_packet_body) {
                 fwrite(&dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__mpeg_data, 1, 1, f_fmv_m1v);
             }
-#ifdef TRACE
+#if defined(TRACE) && defined(TRACE_ON_FMV)
+            if (!do_trace && !do_trace_started_once_via_fmv) {
+                fprintf(stderr, "Trace on by FMV!\n");
+                do_trace = true;
+                do_trace_started_once_via_fmv = true;
+            }
 #endif
         }
         if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fma_data_valid) {
@@ -1485,7 +1543,12 @@ class CDi {
             if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fma_packet_body) {
                 fwrite(&dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__mpeg_data, 1, 1, f_fma_mp2);
             }
-#ifdef TRACE
+#if defined(TRACE) && defined(TRACE_ON_FMA)
+            if (!do_trace && !do_trace_started_once_via_fma) {
+                fprintf(stderr, "Trace on via FMA!\n");
+                do_trace = true;
+                do_trace_started_once_via_fma = true;
+            }
 #endif
         }
 
@@ -1755,6 +1818,7 @@ int main(int argc, char **argv) {
     int machineindex = 0;
     int positional_arguments = 0;
     bool autoplay{false};
+    bool write_png_frames{false};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--events") == 0) {
@@ -1777,8 +1841,10 @@ int main(int argc, char **argv) {
             udp_port = static_cast<uint16_t>(port);
         } else if (strcmp(argv[i], "--auto") == 0) {
             autoplay = true;
+        } else if (strcmp(argv[i], "--png") == 0) {
+            write_png_frames = true;
         } else if (strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [machine] [--auto] [--events script] [--udp port]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [machine] [--auto] [--png] [--events script] [--udp port]\n", argv[0]);
             return 0;
         } else if (positional_arguments++ == 0) {
             machineindex = atoi(argv[i]);
@@ -1847,6 +1913,9 @@ int main(int argc, char **argv) {
     assert(f_cd_bin);
 
     CDi machine(machineindex);
+
+    if (write_png_frames)
+        machine.EnablePngFrames();
 
     if (event_script && !machine.LoadEventScript(event_script))
         return 1;
