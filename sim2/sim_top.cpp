@@ -1,6 +1,7 @@
 // Include common routines
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -31,10 +32,12 @@
 
 #define SCC68070
 #define SLAVE
-// #define TRACE
+#define TRACE
 // #define SIMULATE_RC5
 // #define TRACE_ON_FMA
 // #define TRACE_ON_FMV
+// #define TRACE_FROM_START
+// #define TRACE_ON_CD_REQUEST
 
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg_pc.h"
@@ -218,6 +221,16 @@ template <typename T, typename U> constexpr T BIT(T x, U n) noexcept {
 volatile sig_atomic_t press_button1_signal{false};
 volatile sig_atomic_t toggle_debug_signal{false};
 bool print_instructions{false};
+
+void mount_image(const char *path) {
+    if (f_cd_bin) {
+        fclose(f_cd_bin);
+        f_cd_bin = nullptr;
+    }
+
+    f_cd_bin = fopen(path, "rb");
+    assert(f_cd_bin);
+}
 
 void SignalHandler(int signum, siginfo_t *info, void *context) {
     switch (signum) {
@@ -1170,8 +1183,9 @@ class CDi {
         }
 #endif
 
+        // Make a print of the current tick time with a frequency of 300 Hz (every 3.33ms)
         if ((time30mhz % 100000) == 0) {
-            printf("%d\n", time30mhz);
+            printf("Time %lu\n", time30mhz);
         }
 
         dut.rootp->emu__DOT__cd_media_change = (time30mhz == 1300000);
@@ -1208,6 +1222,13 @@ class CDi {
                 }
 
                 check_scramble(lba, reinterpret_cast<uint8_t *>(hps_buffer));
+
+#if defined(TRACE) && defined(TRACE_ON_CD_REQUEST)
+                if (!do_trace) {
+                    fprintf(stderr, "Trace on by CD Request\n");
+                    do_trace = true;
+                }
+#endif
             } else {
                 // This is TOC area. Just zero all the data
                 memset(hps_buffer, 0, kSectorSize);
@@ -1552,7 +1573,7 @@ class CDi {
 #endif
         }
 
-        if (pixel_index < size - 6) {
+        if (pixel_index < size) {
             uint8_t r, g, b;
 
             r = g = b = 30;
@@ -1725,7 +1746,7 @@ class CDi {
 
         start_time = std::chrono::system_clock::now();
         last_frame_time = std::chrono::system_clock::now();
-#ifdef TRACE
+#if defined(TRACE) && !defined(TRACE_FROM_START)
         do_trace = false;
         fprintf(stderr, "Trace off on start!\n");
 #endif
@@ -1877,40 +1898,37 @@ int main(int argc, char **argv) {
 
     switch (machineindex) {
     case 0:
-        f_cd_bin = fopen("images/addams.bin", "rb");
+        mount_image("images/addams.bin");
         break;
     case 1:
-        f_cd_bin = fopen("images/aims_frogs.iso", "rb");
+        mount_image("images/aims_frogs.iso");
         prepare_artificial_audiocd_toc();
         break;
     case 2:
-        f_cd_bin = fopen("images/LuckyLuke.bin", "rb");
-        prepare_lucky_luke_europe_toc();
+        mount_image("images/CDICTEST.BIN");
         break;
     case 3:
-        f_cd_bin = fopen("images/Zelda Wand of Gamelon.bin", "rb");
+        mount_image("images/Zelda Wand of Gamelon.bin");
         break;
     case 4:
-        f_cd_bin = fopen("images/christ_country.bin", "rb");
+        mount_image("images/christ_country.bin");
         break;
     case 5:
-        f_cd_bin = fopen("images/lost_ride.bin", "rb");
+        mount_image("images/lost_ride.bin");
         break;
     case 6:
-        f_cd_bin = fopen("images/FMVTEST.BIN", "rb");
+        mount_image("images/FMVTEST.BIN");
         break;
     case 7:
-        f_cd_bin = fopen("images/FMVTEST.BIN", "rb");
+        mount_image("images/FMVTEST.BIN");
         break;
     case 8:
-        f_cd_bin = fopen("images/Dragon_s_Lair_US.bin", "rb");
+        mount_image("images/Dragon_s_Lair_US.bin");
         break;
     case 9:
-        f_cd_bin = fopen("images/space_ace_eu.bin", "rb");
+        mount_image("images/space_ace_eu.bin");
         break;
     }
-
-    assert(f_cd_bin);
 
     CDi machine(machineindex);
 
