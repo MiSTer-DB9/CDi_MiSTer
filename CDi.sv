@@ -767,6 +767,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         else if (cd_hps_req) cd_hps_req_during_power_cycle <= 1;
     end
 
+    /* verilator tracing_off */
     sdram sdram (
         .*,
         .init(0),  //~clock_locked),
@@ -783,6 +784,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .burst(prepare_sdram ? 1'b0 : sdram_burst),
         .burstdata_valid(sdram_burstdata_valid)
     );
+    /* verilator tracing_on */
 
 `ifdef VERILATOR
     // DDR3 simulation
@@ -949,6 +951,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     wire cd_data_valid;
     wire cd_stop_sector_delivery;
 
+    /* verilator tracing_off */
     hps_cd_sector_cache hps_cd_sector_cache (
         .clk(clk_sys),
         .reset(cditop_reset),
@@ -971,6 +974,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
 
         .config_disable_seek_time
     );
+    /* verilator tracing_on */
 
     wire forced_snac_rts;
     wire forced_rts_flag;
