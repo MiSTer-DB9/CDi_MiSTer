@@ -10,6 +10,7 @@
 #include <vector>
 #include <verilated.h>
 #include <verilated_fst_c.h>
+#include <verilated_save.h>
 
 // Include model header, generated from Verilating "top.v"
 #include "Vemu.h"
@@ -18,10 +19,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
-#include <png.h>
 
 #include "crc.h"
 #include "hle.h"
+#include "imgwrite.h"
 #include "scramble.h"
 #include "table_of_contents.h"
 #include <arpa/inet.h>
@@ -32,7 +33,6 @@
 
 #define SCC68070
 #define SLAVE
-#define TRACE
 // #define SIMULATE_RC5
 // #define TRACE_ON_FMA
 // #define TRACE_ON_FMV
@@ -53,106 +53,6 @@ char GetPictureType(int val) {
     default:
         return '?';
     }
-}
-
-int WriteBmp(const char *path, int width, int height, uint8_t *pixels) {
-    FILE *fh = fopen(path, "wb");
-    if (!fh) {
-        return 0;
-    }
-
-    int padded_width = (width * 3 + 3) & (~3);
-    int padding = padded_width - (width * 3);
-    int data_size = padded_width * height;
-    int file_size = 54 + data_size;
-
-    fwrite("BM", 1, 2, fh);
-    fwrite(&file_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00", 1, 12, fh);
-    fwrite(&width, 1, 4, fh);
-    fwrite(&height, 1, 4, fh);
-    fwrite("\x01\x00\x18\x00\x00\x00\x00\x00", 1, 8, fh); // planes, bpp, compression
-    fwrite(&data_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 1, 16, fh);
-
-    for (int y = height - 1; y >= 0; y--) {
-        fwrite(pixels + y * width * 3, 3, width, fh);
-        fwrite("\x00\x00\x00\x00", 1, padding, fh);
-    }
-    fclose(fh);
-    return file_size;
-}
-
-// Writes the simulator's RGB framebuffer as a vertically scaled BGR BMP.
-int WriteRgbBmp(const char *path, int width, int height, int vertical_scale, const uint8_t *pixels) {
-    FILE *fh = fopen(path, "wb");
-    if (!fh)
-        return 0;
-
-    const int output_height = height * vertical_scale;
-    const int padded_width = (width * 3 + 3) & (~3);
-    const int data_size = padded_width * output_height;
-    const int file_size = 54 + data_size;
-
-    fwrite("BM", 1, 2, fh);
-    fwrite(&file_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00", 1, 12, fh);
-    fwrite(&width, 1, 4, fh);
-    fwrite(&output_height, 1, 4, fh);
-    fwrite("\x01\x00\x18\x00\x00\x00\x00\x00", 1, 8, fh);
-    fwrite(&data_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 1, 16, fh);
-
-    std::vector<uint8_t> bgr_row(padded_width, 0);
-    for (int y = height - 1; y >= 0; y--) {
-        const uint8_t *row = pixels + y * width * 3;
-        for (int x = 0; x < width; x++) {
-            const uint8_t *pixel = row + x * 3;
-            uint8_t *bgr_pixel = &bgr_row[x * 3];
-            bgr_pixel[0] = pixel[2];
-            bgr_pixel[1] = pixel[1];
-            bgr_pixel[2] = pixel[0];
-        }
-        for (int repeat = 0; repeat < vertical_scale; repeat++) {
-            if (fwrite(bgr_row.data(), 1, padded_width, fh) != static_cast<size_t>(padded_width)) {
-                fclose(fh);
-                return 0;
-            }
-        }
-    }
-    fclose(fh);
-    return file_size;
-}
-
-// Writes the simulator's RGB framebuffer as a vertically scaled PNG.
-int WriteRgbPng(const char *path, int width, int height, int vertical_scale, const uint8_t *pixels) {
-    FILE *file = fopen(path, "wb");
-    if (!file)
-        return 0;
-
-    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    png_infop info = png ? png_create_info_struct(png) : nullptr;
-    if (!png || !info || setjmp(png_jmpbuf(png))) {
-        if (png)
-            png_destroy_write_struct(&png, info ? &info : nullptr);
-        fclose(file);
-        return 0;
-    }
-
-    const int output_height = height * vertical_scale;
-    png_init_io(png, file);
-    png_set_IHDR(png, info, width, output_height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-    png_write_info(png, info);
-
-    std::vector<png_bytep> rows(output_height);
-    for (int row = 0; row < output_height; row++)
-        rows[row] = const_cast<png_bytep>(pixels + (row / vertical_scale) * width * 3);
-    png_write_image(png, rows.data());
-    png_write_end(png, nullptr);
-    png_destroy_write_struct(&png, &info);
-    fclose(file);
-    return 1;
 }
 
 typedef struct {
@@ -213,6 +113,7 @@ const int size = width * height * 3;
 
 FILE *f_cd_bin{nullptr};
 FILE *f_sub_bin{nullptr};
+std::string mounted_image_path;
 
 template <typename T, typename U> constexpr T BIT(T x, U n) noexcept {
     return (x >> n) & T(1);
@@ -230,6 +131,7 @@ void mount_image(const char *path) {
 
     f_cd_bin = fopen(path, "rb");
     assert(f_cd_bin);
+    mounted_image_path = path;
 }
 
 void SignalHandler(int signum, siginfo_t *info, void *context) {
@@ -420,10 +322,6 @@ class CDi {
 #endif
 
     Vemu dut;
-    uint64_t time30mhz = 0;
-    uint64_t tracetime = 0;
-    int frame_index = 0;
-    int fmv_frame_cnt{0};
 
     void EnablePngFrames() {
         write_png_frames = true;
@@ -447,22 +345,12 @@ class CDi {
 
     FILE *f_uart{nullptr};
 
-    uint8_t output_image[size] = {0};
     uint32_t regfile[16];
 #ifdef TRACE
     tracetype_t m_trace;
 #endif
 
-    uint32_t prevpc = 0;
     SttFunction call_func;
-
-    int pixel_index = 0;
-
-    uint16_t hps_buffer[4096];
-    uint16_t hps_buffer_index = 0;
-    bool hps_nvram_backup_active{false};
-    bool ignore_first_hps_din{false};
-    bool executing_dvc_rom_instructions{false};
 
     int instanceid;
     enum class InputKind {
@@ -483,10 +371,105 @@ class CDi {
         uint8_t analog_x{0};
         uint8_t analog_y{0};
     };
-    std::vector<InputEvent> input_events;
+
+    // Persistent host-side state. Keep operating-system resources (files,
+    // sockets, tracing) and the Verilated DUT out of this object: they are
+    // recreated when a process restarts, while the DUT saves itself.
+    struct TestbenchState {
+        static constexpr uint32_t kVersion{1};
+
+        uint32_t version{kVersion};
+        std::string image_path;
+        uint64_t time30mhz{0};
+        uint64_t tracetime{0};
+        uint32_t frame_index{0};
+        uint32_t fmv_frame_cnt{0};
+        uint16_t phase_accumulator{0};
+        uint32_t mpeg_clk_calc_ticks30{0};
+        uint32_t mpeg_clk_calc_ticks{0};
+        uint32_t pixel_index{0};
+        uint16_t hps_buffer_index{0};
+        bool hps_nvram_backup_active{false};
+        bool ignore_first_hps_din{false};
+        bool executing_dvc_rom_instructions{false};
+        uint32_t prevpc{0};
+        uint8_t held_buttons{0};
+        uint64_t button_release_frame[2]{0, 0};
+        uint16_t hps_buffer[4096]{};
+        uint8_t output_image[size]{};
+        std::vector<InputEvent> input_events;
+
+        void Save(VerilatedSave &os) const {
+            os << version << image_path << time30mhz << tracetime;
+            os << frame_index << fmv_frame_cnt << phase_accumulator;
+            os << mpeg_clk_calc_ticks30 << mpeg_clk_calc_ticks << pixel_index;
+            os << hps_buffer_index << hps_nvram_backup_active << ignore_first_hps_din;
+            os << executing_dvc_rom_instructions << prevpc << held_buttons;
+            os << button_release_frame[0] << button_release_frame[1];
+            os.write(hps_buffer, sizeof(hps_buffer));
+            os.write(output_image, sizeof(output_image));
+            const uint32_t event_count = input_events.size();
+            os << event_count;
+            for (const InputEvent &event : input_events)
+                os << event.frame << static_cast<uint8_t>(event.kind) << event.hold_frames << event.analog_x
+                   << event.analog_y;
+        }
+
+        bool Load(VerilatedRestore &os) {
+            os >> version >> image_path >> time30mhz >> tracetime;
+            os >> frame_index >> fmv_frame_cnt >> phase_accumulator;
+            os >> mpeg_clk_calc_ticks30 >> mpeg_clk_calc_ticks >> pixel_index;
+            os >> hps_buffer_index >> hps_nvram_backup_active >> ignore_first_hps_din;
+            os >> executing_dvc_rom_instructions >> prevpc >> held_buttons;
+            os >> button_release_frame[0] >> button_release_frame[1];
+            os.read(hps_buffer, sizeof(hps_buffer));
+            os.read(output_image, sizeof(output_image));
+            uint32_t event_count;
+            os >> event_count;
+            if (event_count > 1000000)
+                return false;
+            input_events.clear();
+            input_events.reserve(event_count);
+            for (uint32_t i = 0; i < event_count; ++i) {
+                InputEvent event{};
+                uint8_t kind;
+                os >> event.frame >> kind >> event.hold_frames >> event.analog_x >> event.analog_y;
+                if (kind > static_cast<uint8_t>(InputKind::Quit))
+                    return false;
+                event.kind = static_cast<InputKind>(kind);
+                input_events.push_back(event);
+            }
+            return true;
+        }
+    };
+
+    TestbenchState testbench;
+    uint64_t &time30mhz{testbench.time30mhz};
+    uint64_t &tracetime{testbench.tracetime};
+    uint32_t &frame_index{testbench.frame_index};
+    uint32_t &fmv_frame_cnt{testbench.fmv_frame_cnt};
+    uint16_t &phase_accumulator{testbench.phase_accumulator};
+    uint32_t &mpeg_clk_calc_ticks30{testbench.mpeg_clk_calc_ticks30};
+    uint32_t &mpeg_clk_calc_ticks{testbench.mpeg_clk_calc_ticks};
+    uint32_t &pixel_index{testbench.pixel_index};
+    uint16_t (&hps_buffer)[4096]{testbench.hps_buffer};
+    uint16_t &hps_buffer_index{testbench.hps_buffer_index};
+    bool &hps_nvram_backup_active{testbench.hps_nvram_backup_active};
+    bool &ignore_first_hps_din{testbench.ignore_first_hps_din};
+    bool &executing_dvc_rom_instructions{testbench.executing_dvc_rom_instructions};
+    uint32_t &prevpc{testbench.prevpc};
+    uint8_t (&output_image)[size]{testbench.output_image};
+    std::vector<InputEvent> &input_events{testbench.input_events};
     int udp_fd{-1};
-    uint64_t button_release_frame[2]{0, 0};
-    uint8_t held_buttons{0};
+    uint64_t (&button_release_frame)[2]{testbench.button_release_frame};
+    uint8_t &held_buttons{testbench.held_buttons};
+    uint64_t save_at_frame{UINT64_MAX};
+    std::string save_state_path;
+    bool save_at_lba_enabled{false};
+    uint32_t save_at_lba{0};
+    std::string save_lba_state_path;
+    enum class SaveRequest { None, Frame, Lba };
+    SaveRequest pending_save{SaveRequest::None};
 
     std::chrono::_V2::system_clock::time_point start_time;
     std::chrono::_V2::system_clock::time_point last_frame_time;
@@ -505,7 +488,73 @@ class CDi {
         return r | g | b;
     }
 
-    uint16_t phase_accumulator;
+  public:
+    bool SaveState(const char *path) {
+        VerilatedSave os;
+        os.open(path);
+        if (!os.isOpen()) {
+            fprintf(stderr, "Unable to write save state %s\n", path);
+            return false;
+        }
+        testbench.image_path = mounted_image_path;
+        testbench.Save(os);
+        os << dut;
+        fprintf(stderr, "Saved state at frame %d to %s\n", frame_index, path);
+        return true;
+    }
+
+    bool LoadState(const char *path) {
+        VerilatedRestore os;
+        os.open(path);
+        if (!os.isOpen()) {
+            fprintf(stderr, "Unable to read save state %s\n", path);
+            return false;
+        }
+        if (!testbench.Load(os) || testbench.version != TestbenchState::kVersion ||
+            testbench.image_path != mounted_image_path) {
+            fprintf(stderr, "Save state %s is for a different format or CD image\n", path);
+            return false;
+        }
+        os >> dut;
+        dut.eval();
+        start_time = std::chrono::system_clock::now();
+        last_frame_time = start_time;
+        fprintf(stderr, "Loaded state at frame %d from %s\n", frame_index, path);
+        return true;
+    }
+
+    void SetSaveAtFrame(uint64_t frame, const char *path) {
+        save_at_frame = frame;
+        save_state_path = path;
+    }
+
+    void SetSaveAtLba(uint32_t lba, const char *path) {
+        save_at_lba_enabled = true;
+        save_at_lba = lba;
+        save_lba_state_path = path;
+    }
+
+  private:
+    void RequestSave(SaveRequest request) {
+        if (pending_save == SaveRequest::None)
+            pending_save = request;
+    }
+
+    void CommitPendingSave() {
+        if (pending_save == SaveRequest::None)
+            return;
+
+        const bool lba_request = pending_save == SaveRequest::Lba;
+        const char *path = lba_request ? save_lba_state_path.c_str() : save_state_path.c_str();
+        if (SaveState(path)) {
+            if (lba_request)
+                fprintf(stderr, "Saved state on seek LBA 0x%08x\n", save_at_lba);
+            status = SIGINT;
+        } else {
+            status = 1;
+        }
+        pending_save = SaveRequest::None;
+    }
 
     void clockmpeg() {
         mpeg_clk_calc_ticks++;
@@ -522,11 +571,6 @@ class CDi {
         }
     }
 
-    // These two are used to calculate the actual MPEG frequency
-    // required to do the job on a frame basis
-    uint32_t mpeg_clk_calc_ticks30{0}; ///< counts 30 MHz clock ticks
-    uint32_t mpeg_clk_calc_ticks{0};   ///< counts MPEG clock ticks
-
     /*
     Primarily creates a 30 MHz clock and
     derives 22.2264 MHz audio clock from that.
@@ -536,16 +580,22 @@ class CDi {
     */
     void clock30() {
         mpeg_clk_calc_ticks30++;
-        mpeg_clk_calc_ticks++;
 
         uint32_t fmv_fifo_level = dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__fifo_level;
+        uint32_t fmv_dsp_enable = dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fmv_dsp_enable;
+
+        bool drive_mpeg_clock = fmv_dsp_enable;
+
+        if (drive_mpeg_clock)
+            mpeg_clk_calc_ticks++;
 
         for (int i = 0; i < 2; i++) {
             // clk_sys is 30 MHz
             dut.rootp->emu__DOT__clk_sys = (i & 1);
 
             // clk_mpeg is 30 MHz when no work is to be done
-            dut.rootp->emu__DOT__clk_mpeg = (i & 1);
+            if (drive_mpeg_clock)
+                dut.rootp->emu__DOT__clk_mpeg = (i & 1);
 
             // clk_audio is 6.615 MHz
             // 6.615 MHz * 2^15 / 30 MHz = 7225.344
@@ -563,12 +613,14 @@ class CDi {
 
         // The FPGA PLL is configured for 80 MHz, but
         // the power is not always required. Scale it up to 60 MHZ
-        if (fmv_fifo_level > 2000) {
+        if (drive_mpeg_clock && fmv_fifo_level > 2000 &&
+            dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo < 3) {
             clockmpeg();
         }
 
         // Ok, scale it up to 90 MHz
-        if (fmv_fifo_level > 8000) {
+        if (drive_mpeg_clock && fmv_fifo_level > 8000 &&
+            dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo < 3) {
             clockmpeg();
         }
     }
@@ -1027,15 +1079,20 @@ class CDi {
     }
 
   public:
-    bool LoadEventScript(const char *path) {
+    // An explicit --events script is an input override, including after a
+    // save-state restore.  Live UDP events continue to append normally.
+    bool ReplaceInputEventsFromScript(const char *path) {
         std::ifstream script(path);
         if (!script) {
             fprintf(stderr, "Unable to open event script %s\n", path);
             return false;
         }
 
+        input_events.clear();
+
         std::string line;
         unsigned int line_number = 0;
+        uint64_t previous_frame = 0;
         while (std::getline(script, line)) {
             line_number++;
             const std::size_t comment = line.find('#');
@@ -1043,13 +1100,29 @@ class CDi {
                 line.erase(comment);
 
             std::istringstream input(line);
-            uint64_t frame;
+            std::string frame_spec;
             std::string command;
             unsigned int hold_frames = 3;
-            if (!(input >> frame))
+            if (!(input >> frame_spec))
                 continue;
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long parsed_frame = strtoull(frame_spec.c_str(), &end, 10);
+            if (*end != '\0' || errno == ERANGE || frame_spec == "-" || (!frame_spec.empty() && frame_spec[0] == '-')) {
+                fprintf(stderr, "%s:%u: expected a frame number or +<frame_increment>\n", path, line_number);
+                return false;
+            }
+            const bool relative_frame = !frame_spec.empty() && frame_spec[0] == '+';
+            uint64_t frame = parsed_frame;
+            if (relative_frame) {
+                if (frame > UINT64_MAX - previous_frame) {
+                    fprintf(stderr, "%s:%u: frame increment overflows\n", path, line_number);
+                    return false;
+                }
+                frame += previous_frame;
+            }
             if (!(input >> command)) {
-                fprintf(stderr, "%s:%u: expected: <frame> <command> [hold_frames]\n", path, line_number);
+                fprintf(stderr, "%s:%u: expected: <frame|+increment> <command> [hold_frames]\n", path, line_number);
                 return false;
             }
             if (command == "analog") {
@@ -1062,6 +1135,7 @@ class CDi {
                 }
                 if (!QueueAnalogEvent(frame, x, y, path, line_number))
                     return false;
+                previous_frame = frame;
                 continue;
             }
             if (input >> hold_frames) {
@@ -1076,6 +1150,7 @@ class CDi {
             }
             if (!QueueInputEvent(frame, command, hold_frames, path, line_number))
                 return false;
+            previous_frame = frame;
         }
 
         fprintf(stderr, "Loaded %zu input events from %s\n", input_events.size(), path);
@@ -1164,6 +1239,15 @@ class CDi {
     void modelstep() {
         time30mhz++;
         clock30();
+
+        // These are the hps_cd_sector_cache inputs, exported by the CDIC.
+        // Check immediately after its clock edge so the one-cycle valid pulse
+        // cannot be missed.
+        if (save_at_lba_enabled && dut.rootp->emu__DOT__cd_seek_lba_valid &&
+            dut.rootp->emu__DOT__cd_seek_lba == save_at_lba) {
+            save_at_lba_enabled = false;
+            RequestSave(SaveRequest::Lba);
+        }
 
 #ifdef SIMULATE_RC5
         if (time30mhz >= rc5_fliptime) {
@@ -1388,16 +1472,38 @@ class CDi {
                 // We are at the beginning of IrqSrvc in fdrvs1. This means that A2 contains fdrvs1_static
                 uint32_t *cpu_a =
                     &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
-                dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static = cpu_a[2];
+
+                if (dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static != cpu_a[2]) {
+                    printf("fdrvs1_static set to %x", cpu_a[2]);
+                    dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static = cpu_a[2];
+                }
             }
 
             if (m_pc == 0x0e5029a) {
                 // We are at the beginning of MA_Play in madriv. This means that A2 contains madriv_static
                 uint32_t *cpu_a =
                     &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
-                dut.rootp->emu__DOT__cditop__DOT__madriv_static = cpu_a[2];
+                if (dut.rootp->emu__DOT__cditop__DOT__madriv_static != cpu_a[2]) {
+                    printf("madriv_static set to %x", cpu_a[2]);
+                    dut.rootp->emu__DOT__cditop__DOT__madriv_static = cpu_a[2];
+                }
             }
 
+            if (m_pc == 0x00e4ee6c) {
+                // 00e4ee64 41 f1 20 70     lea        (0x70,A1,D2w*0x1),A0
+                // 00e4ee68 4a 68 00 00     tst.w      (0x0,A0)
+                // 00e4ee6c 66 08           bne.b      LAB_00e4ee76 <-- We are here
+                // This is part of MV_Info to get the location of MVmapDesc*
+                uint32_t *cpu_a =
+                    &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
+
+                if (dut.rootp->emu__DOT__cditop__DOT__mvmapdesc != cpu_a[0]) {
+                    printf("MVmapDesc set to %x", cpu_a[0]);
+                    dut.rootp->emu__DOT__cditop__DOT__mvmapdesc = cpu_a[0];
+                }
+            }
+
+            dut.rootp->emu__DOT__cditop__DOT__executing_dvc_rom_instructions = m_pc >= 0xe40000 && m_pc < 0xe7ffff;
 #if 0
             executing_dvc_rom_instructions = m_pc >= 0xe40000 && m_pc < 0xe7ffff;
 #endif
@@ -1457,6 +1563,9 @@ class CDi {
 
                 mpeg_clk_calc_ticks30 = 0;
                 mpeg_clk_calc_ticks = 0;
+
+                if (frame_index == save_at_frame)
+                    RequestSave(SaveRequest::Frame);
 
                 if (frame_index == 120) {
                     ScanForOs9Modules();
@@ -1596,6 +1705,10 @@ class CDi {
             output_image[pixel_index++] = g;
             output_image[pixel_index++] = b;
         }
+
+        // Save only after all host-side work for this simulated tick has run.
+        // Verilator is quiescent here: the preceding dut.eval() calls returned.
+        CommitPendingSave();
     }
 
     virtual ~CDi() {
@@ -1675,6 +1788,7 @@ class CDi {
         f_executed_events = fdopen(event_fd, "w");
         assert(f_executed_events);
         fprintf(f_executed_events, "# Executed input events; reusable with --events\n");
+        fprintf(f_executed_events, "# Image: %s\n", mounted_image_path.c_str());
         fflush(f_executed_events);
         fprintf(stderr, "Recording executed input events to %s\n", event_filename);
 
@@ -1836,6 +1950,11 @@ int main(int argc, char **argv) {
 
     const char *event_script = nullptr;
     uint16_t udp_port = 0;
+    const char *load_state = nullptr;
+    const char *save_state = nullptr;
+    uint64_t save_frame = 0;
+    const char *save_lba_state = nullptr;
+    uint32_t save_lba = 0;
     int machineindex = 0;
     int positional_arguments = 0;
     bool autoplay{false};
@@ -1848,6 +1967,37 @@ int main(int argc, char **argv) {
                 return 1;
             }
             event_script = argv[i];
+        } else if (strcmp(argv[i], "--load-state") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--load-state requires a path\n");
+                return 1;
+            }
+            load_state = argv[i];
+        } else if (strcmp(argv[i], "--save-at-frame") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--save-at-frame requires a frame and path\n");
+                return 1;
+            }
+            char *end = nullptr;
+            save_frame = strtoull(argv[++i], &end, 10);
+            if (*end != '\0') {
+                fprintf(stderr, "Invalid save frame: %s\n", argv[i]);
+                return 1;
+            }
+            save_state = argv[++i];
+        } else if (strcmp(argv[i], "--save-at-lba") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--save-at-lba requires an LBA and path\n");
+                return 1;
+            }
+            char *end = nullptr;
+            const unsigned long long lba = strtoull(argv[++i], &end, 0);
+            if (*end != '\0' || lba > UINT32_MAX) {
+                fprintf(stderr, "Invalid save LBA: %s\n", argv[i]);
+                return 1;
+            }
+            save_lba = lba;
+            save_lba_state = argv[++i];
         } else if (strcmp(argv[i], "--udp") == 0) {
             if (++i == argc) {
                 fprintf(stderr, "--udp requires a port\n");
@@ -1865,7 +2015,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--png") == 0) {
             write_png_frames = true;
         } else if (strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [machine] [--auto] [--png] [--events script] [--udp port]\n", argv[0]);
+            fprintf(stderr,
+                    "Usage: %s [machine] [--auto] [--png] [--events script] [--udp port] [--load-state file] "
+                    "[--save-at-frame frame file] [--save-at-lba lba file]\n",
+                    argv[0]);
             return 0;
         } else if (positional_arguments++ == 0) {
             machineindex = atoi(argv[i]);
@@ -1898,7 +2051,7 @@ int main(int argc, char **argv) {
 
     switch (machineindex) {
     case 0:
-        mount_image("images/addams.bin");
+        mount_image("images/nimh.bin");
         break;
     case 1:
         mount_image("images/aims_frogs.iso");
@@ -1932,10 +2085,17 @@ int main(int argc, char **argv) {
 
     CDi machine(machineindex);
 
+    if (load_state && !machine.LoadState(load_state))
+        return 1;
+    if (save_state)
+        machine.SetSaveAtFrame(save_frame, save_state);
+    if (save_lba_state)
+        machine.SetSaveAtLba(save_lba, save_lba_state);
+
     if (write_png_frames)
         machine.EnablePngFrames();
 
-    if (event_script && !machine.LoadEventScript(event_script))
+    if (event_script && !machine.ReplaceInputEventsFromScript(event_script))
         return 1;
     if (udp_port && !machine.EnableUdpInput(udp_port))
         return 1;
@@ -1958,7 +2118,8 @@ int main(int argc, char **argv) {
     machine.DumpDvcSysMemory();
     machine.dump_slave_memory();
 
-    fclose(f_cd_bin);
+    if (f_cd_bin)
+        fclose(f_cd_bin);
 
     fprintf(stderr, "Closing...\n");
     fflush(stdout);
