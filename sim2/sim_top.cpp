@@ -24,6 +24,7 @@
 #include "hle.h"
 #include "imgwrite.h"
 #include "scramble.h"
+#include "stack_analyzer.hpp"
 #include "table_of_contents.h"
 #include <arpa/inet.h>
 #include <byteswap.h>
@@ -35,7 +36,7 @@
 #define SLAVE
 // #define SIMULATE_RC5
 // #define TRACE_ON_FMA
-// #define TRACE_ON_FMV
+#define TRACE_ON_FMV
 // #define TRACE_FROM_START
 // #define TRACE_ON_CD_REQUEST
 
@@ -323,11 +324,14 @@ class CDi {
 
     Vemu dut;
 
-    void EnablePngFrames() {
-        write_png_frames = true;
+    void EnableBmpFrames() {
+        write_bmp_frames = true;
     }
 
   private:
+    RiscVStackAnalyzer worker_stack_analysis;
+    RiscVStackAnalyzer decoder_stack_analysis;
+
     FILE *f_audio_left{nullptr};
     FILE *f_audio_right{nullptr};
     FILE *f_fma{nullptr};
@@ -336,7 +340,7 @@ class CDi {
     FILE *f_fmv{nullptr};
     FILE *f_fmv_m1v{nullptr};
     FILE *f_executed_events{nullptr};
-    bool write_png_frames{false};
+    bool write_bmp_frames{false};
 
     int fmv_index{0};
     /// @brief Used to decide whether a new index must be created
@@ -362,6 +366,7 @@ class CDi {
         TraceOff,
         InstructionsOn,
         InstructionsOff,
+        SaveState,
         Quit
     };
     struct InputEvent {
@@ -370,13 +375,14 @@ class CDi {
         unsigned int hold_frames{3};
         uint8_t analog_x{0};
         uint8_t analog_y{0};
+        std::string save_path;
     };
 
     // Persistent host-side state. Keep operating-system resources (files,
     // sockets, tracing) and the Verilated DUT out of this object: they are
     // recreated when a process restarts, while the DUT saves itself.
     struct TestbenchState {
-        static constexpr uint32_t kVersion{1};
+        static constexpr uint32_t kVersion{2};
 
         uint32_t version{kVersion};
         std::string image_path;
@@ -412,7 +418,7 @@ class CDi {
             os << event_count;
             for (const InputEvent &event : input_events)
                 os << event.frame << static_cast<uint8_t>(event.kind) << event.hold_frames << event.analog_x
-                   << event.analog_y;
+                   << event.analog_y << event.save_path;
         }
 
         bool Load(VerilatedRestore &os) {
@@ -433,7 +439,7 @@ class CDi {
             for (uint32_t i = 0; i < event_count; ++i) {
                 InputEvent event{};
                 uint8_t kind;
-                os >> event.frame >> kind >> event.hold_frames >> event.analog_x >> event.analog_y;
+                os >> event.frame >> kind >> event.hold_frames >> event.analog_x >> event.analog_y >> event.save_path;
                 if (kind > static_cast<uint8_t>(InputKind::Quit))
                     return false;
                 event.kind = static_cast<InputKind>(kind);
@@ -464,11 +470,16 @@ class CDi {
     uint64_t (&button_release_frame)[2]{testbench.button_release_frame};
     uint8_t &held_buttons{testbench.held_buttons};
     uint64_t save_at_frame{UINT64_MAX};
+    uint64_t max_frames{UINT64_MAX};
+    bool frame_limit_is_success{false};
     std::string save_state_path;
+    std::vector<std::string> scripted_save_paths;
     bool save_at_lba_enabled{false};
     uint32_t save_at_lba{0};
     std::string save_lba_state_path;
-    enum class SaveRequest { None, Frame, Lba };
+    bool save_on_first_cd_access_enabled{false};
+    std::string first_cd_access_state_path;
+    enum class SaveRequest { None, Frame, Lba, FirstCdAccess };
     SaveRequest pending_save{SaveRequest::None};
 
     std::chrono::_V2::system_clock::time_point start_time;
@@ -489,6 +500,26 @@ class CDi {
     }
 
   public:
+    void PrintMaximumStackUsage() {
+        int result;
+
+        result = decoder_stack_analysis.MeasureMaximumStackUsage(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__core1mem__DOT__ram[0]);
+        printf("MPEG Video Bitstream Decoder Stack Usage %d\n", result);
+
+        result = worker_stack_analysis.MeasureMaximumStackUsage(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker2__DOT__core2mem__DOT__ram[0]);
+        printf("MPEG Video Frame Worker2 Stack Usage %d\n", result);
+
+        result = worker_stack_analysis.MeasureMaximumStackUsage(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker3__DOT__core2mem__DOT__ram[0]);
+        printf("MPEG Video Frame Worker3 Stack Usage %d\n", result);
+
+        result = worker_stack_analysis.MeasureMaximumStackUsage(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker4__DOT__core2mem__DOT__ram[0]);
+        printf("MPEG Video Frame Worker4 Stack Usage %d\n", result);
+    }
+
     bool SaveState(const char *path) {
         VerilatedSave os;
         os.open(path);
@@ -510,9 +541,8 @@ class CDi {
             fprintf(stderr, "Unable to read save state %s\n", path);
             return false;
         }
-        if (!testbench.Load(os) || testbench.version != TestbenchState::kVersion ||
-            testbench.image_path != mounted_image_path) {
-            fprintf(stderr, "Save state %s is for a different format or CD image\n", path);
+        if (!testbench.Load(os) || testbench.version != TestbenchState::kVersion) {
+            fprintf(stderr, "Save state %s is for a different format\n", path);
             return false;
         }
         os >> dut;
@@ -528,10 +558,20 @@ class CDi {
         save_state_path = path;
     }
 
+    void SetMaxFrames(uint64_t frames, bool successful_stop = false) {
+        max_frames = frames;
+        frame_limit_is_success = successful_stop;
+    }
+
     void SetSaveAtLba(uint32_t lba, const char *path) {
         save_at_lba_enabled = true;
         save_at_lba = lba;
         save_lba_state_path = path;
+    }
+
+    void SetSaveOnFirstCdAccess(const char *path) {
+        save_on_first_cd_access_enabled = true;
+        first_cd_access_state_path = path;
     }
 
   private:
@@ -541,14 +581,26 @@ class CDi {
     }
 
     void CommitPendingSave() {
+        // Script saves continue execution, but must capture the same completed
+        // host tick as CLI checkpoints. A mid-tick save cannot replay exactly.
+        for (const auto &path : scripted_save_paths) {
+            if (!SaveState(path.c_str()))
+                status = 1;
+        }
+        scripted_save_paths.clear();
         if (pending_save == SaveRequest::None)
             return;
 
         const bool lba_request = pending_save == SaveRequest::Lba;
-        const char *path = lba_request ? save_lba_state_path.c_str() : save_state_path.c_str();
+        const bool first_cd_access_request = pending_save == SaveRequest::FirstCdAccess;
+        const char *path = lba_request               ? save_lba_state_path.c_str()
+                           : first_cd_access_request ? first_cd_access_state_path.c_str()
+                                                     : save_state_path.c_str();
         if (SaveState(path)) {
             if (lba_request)
                 fprintf(stderr, "Saved state on seek LBA 0x%08x\n", save_at_lba);
+            else if (first_cd_access_request)
+                fprintf(stderr, "Saved state on first CD access\n");
             status = SIGINT;
         } else {
             status = 1;
@@ -916,6 +968,17 @@ class CDi {
         return true;
     }
 
+    bool QueueSaveStateEvent(uint64_t frame, const std::string &path, const char *source, unsigned int line_number) {
+        if (path.empty()) {
+            fprintf(stderr, "%s:%u: save requires a path\n", source, line_number);
+            return false;
+        }
+        input_events.push_back({frame, InputKind::SaveState, 0, 0, 0, path});
+        std::stable_sort(input_events.begin(), input_events.end(),
+                         [](const InputEvent &a, const InputEvent &b) { return a.frame < b.frame; });
+        return true;
+    }
+
     void PollUdpInput() {
         if (udp_fd < 0)
             return;
@@ -953,6 +1016,13 @@ class CDi {
                 int y;
                 std::string extra;
                 if (!(input >> x >> y) || (input >> extra) || !QueueAnalogEvent(frame, x, y, "UDP", 0))
+                    fprintf(stderr, "Ignoring malformed UDP input: %s\n", buffer);
+                continue;
+            }
+            if (command == "save") {
+                std::string path;
+                std::string extra;
+                if (!(input >> path) || (input >> extra) || !QueueSaveStateEvent(frame, path, "UDP", 0))
                     fprintf(stderr, "Ignoring malformed UDP input: %s\n", buffer);
                 continue;
             }
@@ -998,6 +1068,9 @@ class CDi {
             break;
         case InputKind::InstructionsOff:
             fprintf(f_executed_events, "%d instructions_off\n", frame_index);
+            break;
+        case InputKind::SaveState:
+            fprintf(f_executed_events, "%d save %s\n", frame_index, event.save_path.c_str());
             break;
         case InputKind::Quit:
             fprintf(f_executed_events, "%d quit\n", frame_index);
@@ -1070,6 +1143,9 @@ class CDi {
             case InputKind::InstructionsOff:
                 print_instructions = false;
                 break;
+            case InputKind::SaveState:
+                scripted_save_paths.push_back(event.save_path);
+                break;
             case InputKind::Quit:
                 status = SIGINT;
                 break;
@@ -1138,6 +1214,18 @@ class CDi {
                 previous_frame = frame;
                 continue;
             }
+            if (command == "save") {
+                std::string save_path;
+                std::string extra;
+                if (!(input >> save_path) || (input >> extra)) {
+                    fprintf(stderr, "%s:%u: expected: <frame> save <path>\n", path, line_number);
+                    return false;
+                }
+                if (!QueueSaveStateEvent(frame, save_path, path, line_number))
+                    return false;
+                previous_frame = frame;
+                continue;
+            }
             if (input >> hold_frames) {
                 std::string extra;
                 if (input >> extra) {
@@ -1153,6 +1241,11 @@ class CDi {
             previous_frame = frame;
         }
 
+        // A reusable script may start before a restored checkpoint. Keep the
+        // absolute timing of its remaining events without replaying history.
+        input_events.erase(std::remove_if(input_events.begin(), input_events.end(),
+                                          [this](const InputEvent &event) { return event.frame < frame_index; }),
+                           input_events.end());
         fprintf(stderr, "Loaded %zu input events from %s\n", input_events.size(), path);
         return true;
     }
@@ -1342,6 +1435,10 @@ class CDi {
             reinterleave_rw_subchannels(reinterpret_cast<uint8_t (*)[12]>(&rw[24]), out.rw);
 
             hps_buffer_index = 0;
+            if (save_on_first_cd_access_enabled) {
+                save_on_first_cd_access_enabled = false;
+                RequestSave(SaveRequest::FirstCdAccess);
+            }
         }
 
         if (dut.rootp->emu__DOT__nvram_hps_rd && dut.rootp->emu__DOT__nvram_hps_ack == 0 &&
@@ -1548,11 +1645,11 @@ class CDi {
                 std::chrono::duration<double> elapsed_seconds_since_last_frame = current - last_frame_time;
                 last_frame_time = current;
 
-                sprintf(filename, "%d/video_%03d.%s", instanceid, frame_index, write_png_frames ? "png" : "bmp");
-                if (write_png_frames ? !WriteRgbPng(filename, width, height, 4, output_image)
-                                     : !WriteRgbBmp(filename, width, height, 4, output_image))
+                sprintf(filename, "%d/video_%03d.%s", instanceid, frame_index, write_bmp_frames ? "bmp" : "png");
+                if (write_bmp_frames ? !WriteRgbBmp(filename, width, height, 4, output_image)
+                                     : !WriteRgbPng(filename, width, height, 4, output_image))
                     abort();
-                printf("Written video_%03d.%s\n", frame_index, write_png_frames ? "png" : "bmp");
+                printf("Written video_%03d.%s\n", frame_index, write_bmp_frames ? "bmp" : "png");
                 // printf("We are at time30mhz=%ld\n", time30mhz);
 
                 uint32_t mpeg_frequency = mpeg_clk_calc_ticks * 30 / mpeg_clk_calc_ticks30;
@@ -1572,6 +1669,10 @@ class CDi {
                 }
                 frame_index++;
                 dut.rootp->emu__DOT__cditop__DOT__frame_index = frame_index;
+                if (frame_index >= max_frames && status == 0) {
+                    fprintf(stderr, "Maximum frame count %lu reached\n", max_frames);
+                    status = frame_limit_is_success ? SIGINT : 1;
+                }
             }
             pixel_index = 0;
             memset(output_image, 0, sizeof(output_image));
@@ -1824,7 +1925,7 @@ class CDi {
         dut.trace(&m_trace, 5);
 
         if (do_trace) {
-            sprintf(filename, "/tmp/waveform.vcd", instanceid);
+            sprintf(filename, "/tmp/waveform.fst", instanceid);
             fprintf(stderr, "Writing to %s\n", filename);
             m_trace.open(filename);
         }
@@ -1845,8 +1946,23 @@ class CDi {
             clock30();
         }
 
+        // Zero virtual DDR4 memory
         memset(&dut.rootp->emu__DOT__ddram[0], 0x00, 5000000);
+
+        // Zero Video and DVC RAM
         memset(&dut.rootp->emu__DOT__ram[0], 0x00, 2097152 * 2);
+
+        decoder_stack_analysis.ReadMapFile("../sw/mpeg_video/firmware1.map");
+        worker_stack_analysis.ReadMapFile("../sw/mpeg_video/firmware2.map");
+
+        worker_stack_analysis.InsertWatermarks(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker2__DOT__core2mem__DOT__ram[0]);
+        worker_stack_analysis.InsertWatermarks(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker3__DOT__core2mem__DOT__ram[0]);
+        worker_stack_analysis.InsertWatermarks(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__worker4__DOT__core2mem__DOT__ram[0]);
+        decoder_stack_analysis.InsertWatermarks(
+            &dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__core1mem__DOT__ram[0]);
 
 #if 0
         FILE *f = fopen("ddramdump.bin", "rb");
@@ -1952,13 +2068,17 @@ int main(int argc, char **argv) {
     uint16_t udp_port = 0;
     const char *load_state = nullptr;
     const char *save_state = nullptr;
+    const char *image_path = nullptr;
     uint64_t save_frame = 0;
+    uint64_t max_frames = 0;
+    bool max_frames_set{false};
     const char *save_lba_state = nullptr;
     uint32_t save_lba = 0;
+    const char *first_cd_access_state = nullptr;
     int machineindex = 0;
     int positional_arguments = 0;
     bool autoplay{false};
-    bool write_png_frames{false};
+    bool write_bmp_frames{false};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--events") == 0) {
@@ -1967,6 +2087,12 @@ int main(int argc, char **argv) {
                 return 1;
             }
             event_script = argv[i];
+        } else if (strcmp(argv[i], "--image") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--image requires a path\n");
+                return 1;
+            }
+            image_path = argv[i];
         } else if (strcmp(argv[i], "--load-state") == 0) {
             if (++i == argc) {
                 fprintf(stderr, "--load-state requires a path\n");
@@ -1985,6 +2111,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
             save_state = argv[++i];
+        } else if (strcmp(argv[i], "--max-frames") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--max-frames requires a frame count\n");
+                return 1;
+            }
+            char *end = nullptr;
+            max_frames = strtoull(argv[i], &end, 10);
+            if (*end != '\0' || max_frames == 0) {
+                fprintf(stderr, "Invalid maximum frame count: %s\n", argv[i]);
+                return 1;
+            }
+            max_frames_set = true;
         } else if (strcmp(argv[i], "--save-at-lba") == 0) {
             if (i + 2 >= argc) {
                 fprintf(stderr, "--save-at-lba requires an LBA and path\n");
@@ -1998,6 +2136,12 @@ int main(int argc, char **argv) {
             }
             save_lba = lba;
             save_lba_state = argv[++i];
+        } else if (strcmp(argv[i], "--save-on-first-cd-access") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--save-on-first-cd-access requires a path\n");
+                return 1;
+            }
+            first_cd_access_state = argv[i];
         } else if (strcmp(argv[i], "--udp") == 0) {
             if (++i == argc) {
                 fprintf(stderr, "--udp requires a port\n");
@@ -2012,12 +2156,14 @@ int main(int argc, char **argv) {
             udp_port = static_cast<uint16_t>(port);
         } else if (strcmp(argv[i], "--auto") == 0) {
             autoplay = true;
-        } else if (strcmp(argv[i], "--png") == 0) {
-            write_png_frames = true;
+        } else if (strcmp(argv[i], "--bmp") == 0) {
+            write_bmp_frames = true;
         } else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
-                    "Usage: %s [machine] [--auto] [--png] [--events script] [--udp port] [--load-state file] "
-                    "[--save-at-frame frame file] [--save-at-lba lba file]\n",
+                    "Usage: %s [machine] [--image path] [--auto] [--png] [--events script] [--udp port] [--load-state "
+                    "file] "
+                    "[--save-at-frame frame file] [--max-frames count] [--save-at-lba lba file] "
+                    "[--save-on-first-cd-access file]\n",
                     argv[0]);
             return 0;
         } else if (positional_arguments++ == 0) {
@@ -2051,11 +2197,10 @@ int main(int argc, char **argv) {
 
     switch (machineindex) {
     case 0:
-        mount_image("images/nimh.bin");
+        mount_image("images/addams.bin");
         break;
     case 1:
-        mount_image("images/aims_frogs.iso");
-        prepare_artificial_audiocd_toc();
+        mount_image("images/addams.bin");
         break;
     case 2:
         mount_image("images/CDICTEST.BIN");
@@ -2083,17 +2228,25 @@ int main(int argc, char **argv) {
         break;
     }
 
+    if (image_path)
+        mount_image(image_path);
+
     CDi machine(machineindex);
 
     if (load_state && !machine.LoadState(load_state))
         return 1;
     if (save_state)
         machine.SetSaveAtFrame(save_frame, save_state);
+    if (max_frames_set)
+        // With no script or checkpoint, the frame limit is the intended end.
+        machine.SetMaxFrames(max_frames, !event_script && !save_state && !save_lba_state && !first_cd_access_state);
     if (save_lba_state)
         machine.SetSaveAtLba(save_lba, save_lba_state);
+    if (first_cd_access_state)
+        machine.SetSaveOnFirstCdAccess(first_cd_access_state);
 
-    if (write_png_frames)
-        machine.EnablePngFrames();
+    if (write_bmp_frames)
+        machine.EnableBmpFrames();
 
     if (event_script && !machine.ReplaceInputEventsFromScript(event_script))
         return 1;
@@ -2114,6 +2267,9 @@ int main(int argc, char **argv) {
     machine.modelstep();
     machine.modelstep();
     machine.modelstep();
+
+    machine.PrintMaximumStackUsage();
+
     machine.DumpBaseCaseMemory();
     machine.DumpDvcSysMemory();
     machine.dump_slave_memory();
@@ -2124,5 +2280,5 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Closing...\n");
     fflush(stdout);
 
-    return 0;
+    return status == 1 ? 1 : 0;
 }
