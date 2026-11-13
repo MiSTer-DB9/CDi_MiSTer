@@ -72,9 +72,6 @@ by unplugging the current device and plugging in the next.
   * Aspect Ratio
   * Scale
   * Vertical Crop - Off, On(270) - For improved integer scaling
-  * RGB Scale
-    * 0-255 - Full RGB range
-    * 16-235 - Reduced RGB range (might provide more accurate color / more contrast)
 * Hardware Config
   * Ports - Either 1 Player with additional UART, or 2 players.*
   * Disable VMPEG DVC - Reset core to take effect
@@ -107,7 +104,10 @@ Note*: 2 controllers are an unusual state for a CD-i machine. Keep that in mind.
 
 By the time of writing, an optical drive emulator is not available for physical CD-i machines.
 It is therefore encouraged to test on CD-i emulators before burning to disc.
+
 [This core can be used to test your creations to some extent](doc/cdi_homebrew.md)
+
+[If extensive debugging is required, a software emulator might be a better choice](doc/other_emulators.md)
 
 ### Issues with external dependencies
 

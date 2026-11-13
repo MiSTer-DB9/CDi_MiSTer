@@ -51,6 +51,8 @@ module mcd212 (
     output          vsync,
     output bit      hblank,
     output          vblank,
+    output          hblank_ext,
+    output          vblank_ext,
     output          vga_f1,
     output bit      vsd,
 
@@ -68,8 +70,10 @@ module mcd212 (
     output irq,
 
     input [1:0] debug_force_video_plane,
-    input [1:0] debug_limited_to_full,
-    input disable_cpu_starve
+    input config_disable_cpu_starve,
+    input config_rgb888,
+    input config_crop_st
+
 );
 
     // Memory Swapping according to chapter 3.4
@@ -463,11 +467,14 @@ module mcd212 (
     always_comb begin
         cpu_starve = 0;
 
-        if (!disable_cpu_starve) begin
+        if (!config_disable_cpu_starve) begin
             if (vblank) cpu_starve = video_x > 1200;
             else cpu_starve = video_x > 1200;
         end
     end
+
+    wire hblank_no_st;
+    wire vblank_no_st;
 
     video_timing vt (
         .clk,
@@ -485,9 +492,13 @@ module mcd212 (
         .vsync(vsync),
         .hblank(hblank_vt),
         .vblank(vblank),
-        .new_line(new_line)
+        .new_line(new_line),
+        .hblank_no_st(hblank_no_st),
+        .vblank_no_st(vblank_no_st)
     );
 
+    assign hblank_ext = config_crop_st ? hblank : hblank_no_st;
+    assign vblank_ext = config_crop_st ? vblank : vblank_no_st;
 
     struct packed {
         bit de;
@@ -534,7 +545,18 @@ module mcd212 (
 
     always_ff @(posedge clk) begin
         if (reset) begin
+`ifdef VERILATOR
             command_register_dcr1 <= 0;
+`else
+            // Don't reset fd to keep the current PAL/NTSC setting
+            command_register_dcr1.de  <= 0;
+            command_register_dcr1.cf  <= 1;
+            command_register_dcr1.sm  <= 0;
+            command_register_dcr1.cm1 <= 0;
+            command_register_dcr1.ic1 <= 0;
+            command_register_dcr1.dc1 <= 0;
+`endif
+
             command_register_dcr2 <= 0;
             control_register_crsr1w <= 0;
             control_register_crsr2w <= 0;
@@ -601,11 +623,11 @@ module mcd212 (
 
     region_entry region_control[8];
 
-    clut_entry_s clut_out0;
-    clut_entry_s clut_out1;
+    rgb888_s clut_out0;
+    rgb888_s clut_out1;
 
-    clut_entry_s clut_wr_data0;
-    clut_entry_s clut_wr_data1;
+    rgb888_s clut_wr_data0;
+    rgb888_s clut_wr_data1;
     bit [7:0] clut_wr_addr0;
     bit [7:0] clut_wr_addr1;
 
@@ -626,10 +648,10 @@ module mcd212 (
         .q_b(clut_out1)
     );
 
-    clut_entry_s trans_color_plane_a;
-    clut_entry_s trans_color_plane_b;
-    clut_entry_s mask_color_plane_a;
-    clut_entry_s mask_color_plane_b;
+    rgb666_s trans_color_plane_a;
+    rgb666_s trans_color_plane_b;
+    rgb666_s mask_color_plane_a;
+    rgb666_s mask_color_plane_b;
 
     wire [15:0] ica0_din = sdram_dout;
     wire [15:0] ica1_din = sdram_dout;
@@ -650,7 +672,7 @@ module mcd212 (
     bit [21:0] ica1_vsr;
     bit ica1_irq;
 
-    wire dca0_read = hblank_vt && !hblank_vt_q && !vblank && command_register_dcr1.dc1;
+    wire dca0_read = hblank_vt && !hblank_vt_q && !vblank && command_register_dcr1.dc1 && command_register_dcr1.de;
     ica_dca_ctrl #(
         .unit_index(0)
     ) ica0 (
@@ -674,7 +696,7 @@ module mcd212 (
         .parity(ica_parity)
     );
 
-    wire dca1_read = hblank_vt && !hblank_vt_q && !vblank && command_register_dcr2.dc2;
+    wire dca1_read = hblank_vt && !hblank_vt_q && !vblank && command_register_dcr2.dc2 && command_register_dcr1.de;
     ica_dca_ctrl #(
         .unit_index(1)
     ) ica1 (
@@ -701,18 +723,11 @@ module mcd212 (
     wire [15:0] file0_din = sdram_dout;
     wire [15:0] file1_din = sdram_dout;
 
+    // No reset is allowed here to keep the video stable
     always_ff @(posedge clk) begin
-        if (reset) begin
-            hblank_vt_q <= 0;
-            hblank_vt_q2 <= 0;
-            hblank <= 0;
-        end else begin
-            hblank_vt_q <= hblank_vt;
-            hblank_vt_q2 <= hblank_vt_q;
-
-            hblank <= hblank_vt_q2;
-        end
-
+        hblank_vt_q <= hblank_vt;
+        hblank_vt_q2 <= hblank_vt_q;
+        hblank <= hblank_vt_q2;
     end
 
     pixelstream file0_out (.clk);
@@ -1095,10 +1110,10 @@ module mcd212 (
 
     rgb555_s rgb555;
 
-    function clut_entry_s RGB888ToClut(input rgb888_s rgb);
-        RGB888ToClut.r = rgb.r[7:2];
-        RGB888ToClut.g = rgb.g[7:2];
-        RGB888ToClut.b = rgb.b[7:2];
+    function rgb666_s RGB8To6(input rgb888_s rgb);
+        RGB8To6.r = rgb.r[7:2];
+        RGB8To6.g = rgb.g[7:2];
+        RGB8To6.b = rgb.b[7:2];
     endfunction
 
     bit plane_a_visible;
@@ -1123,14 +1138,23 @@ module mcd212 (
     end
 
     // Ignore Color Key for DYUV. Use it only for CLUT!
-    wire plane_a_color_key_match = (clut_out0 == trans_color_plane_a) && !plane_a_dyuv_active && (image_coding_method_register.cm13_10_planea != 0);
-    wire plane_b_color_key_match = (clut_out1 == trans_color_plane_b) && !plane_b_dyuv_active && (image_coding_method_register.cm23_20_planeb != 0);
+    wire plane_a_color_key_match = (RGB8To6(
+        clut_out0
+    ) == trans_color_plane_a) && !plane_a_dyuv_active &&
+        (image_coding_method_register.cm13_10_planea != 0);
+
+    wire plane_b_color_key_match = (RGB8To6(
+        clut_out1
+    ) == trans_color_plane_b) && !plane_b_dyuv_active &&
+        (image_coding_method_register.cm23_20_planeb != 0);
 
     function automatic [7:0] WeightCalc(input [7:0] rgb, input [5:0] weight);
+        bit [3:0] invert_weight = 15 - weight[5:2];
+
         if (weight == 0) begin
-            WeightCalc = 0;
+            WeightCalc = 16;
         end else begin
-            WeightCalc = 8'((15'(rgb) * (15'(weight) + 15'd1)) >> 6);
+            WeightCalc = 8'((15'(rgb) * (15'(weight) + 15'd1)) >> 6) + {4'b0, invert_weight};
         end
     endfunction
 
@@ -1138,9 +1162,15 @@ module mcd212 (
         bit plane_a_transparent;  // Because logic in datasheet is also inverted
         bit [7:0] r, g, b;
         plane_a_transparent = 1;
-        r = {clut_out0.r, 2'b00};
-        g = {clut_out0.g, 2'b00};
-        b = {clut_out0.b, 2'b00};
+        r = clut_out0.r;
+        g = clut_out0.g;
+        b = clut_out0.b;
+
+        if (!config_rgb888) begin
+            r[1:0] = 0;
+            g[1:0] = 0;
+            b[1:0] = 0;
+        end
 
         if (plane_a_dyuv_active) begin
             r = dyuv0_out.r;
@@ -1154,10 +1184,9 @@ module mcd212 (
             plane_a.b = WeightCalc(b, weight_a);
         end else begin
             // According to 8.1 PLANES, OFF is black level of 16
-            // On a real CD-i it is much blacker than 16. I assume 0
-            plane_a.r = 0;
-            plane_a.g = 0;
-            plane_a.b = 0;
+            plane_a.r = 16;
+            plane_a.g = 16;
+            plane_a.b = 16;
         end
 
         if (command_register_dcr1.ic1) begin
@@ -1198,9 +1227,15 @@ module mcd212 (
         bit [7:0] r, g, b;
         plane_b_transparent = 1;
 
-        r = {clut_out1.r, 2'b00};
-        g = {clut_out1.g, 2'b00};
-        b = {clut_out1.b, 2'b00};
+        r = clut_out1.r;
+        g = clut_out1.g;
+        b = clut_out1.b;
+
+        if (!config_rgb888) begin
+            r[1:0] = 0;
+            g[1:0] = 0;
+            b[1:0] = 0;
+        end
 
         if (plane_b_dyuv_active) begin
             r = dyuv1_out.r;
@@ -1220,10 +1255,9 @@ module mcd212 (
             plane_b.b = WeightCalc(b, weight_b);
         end else begin
             // According to 8.1 PLANES, OFF is black level of 16
-            // On a real CD-i it is much blacker than 16. I assume 0
-            plane_b.r = 0;
-            plane_b.g = 0;
-            plane_b.b = 0;
+            plane_b.r = 16;
+            plane_b.g = 16;
+            plane_b.b = 16;
         end
 
         if (command_register_dcr2.ic2) begin
@@ -1260,38 +1294,29 @@ module mcd212 (
     end
 
     function automatic [7:0] clamped_mix(input [7:0] a, input [7:0] b);
-        bit [8:0] sum = a + b;
+        bit signed [9:0] sum = {1'b0, a} + {1'b0, b} - 16;
         if (sum > 255) clamped_mix = 255;
+        else if (sum < 0) clamped_mix = 0;
         else clamped_mix = sum[7:0];
-    endfunction
-
-    // Scales 16-235 to 0-255
-    function automatic [7:0] limited_to_full1(input [7:0] value);
-        if (value >= 235) limited_to_full1 = 255;
-        else if (value <= 16) limited_to_full1 = 0;
-        else limited_to_full1 = (value - 16) * 37 / 32;
-    endfunction
-
-    // Scales 16-255 to 0-255
-    function automatic [7:0] limited_to_full2(input [7:0] value);
-        if (value <= 16) limited_to_full2 = 0;
-        else limited_to_full2 = (value - 16) * 34 / 32;
     endfunction
 
     always_comb begin
         bit backdrop_pixel;
 
         // start with the backdrop color
-        vidout.r = backdrop_color_register.r ? 8'hff : 0;
-        vidout.g = backdrop_color_register.g ? 8'hff : 0;
-        vidout.b = backdrop_color_register.b ? 8'hff : 0;
-        backdrop_pixel = (!plane_a_visible_q && !plane_b_visible_q);
         if (!backdrop_color_register.y) begin
             // Half brightness
-            vidout.r[7] = 0;
-            vidout.g[7] = 0;
-            vidout.b[7] = 0;
+            vidout.r = backdrop_color_register.r ? 122 : 16;
+            vidout.g = backdrop_color_register.g ? 122 : 16;
+            vidout.b = backdrop_color_register.b ? 122 : 16;
+        end else begin
+            // Full brightness
+            vidout.r = backdrop_color_register.r ? 230 : 16;
+            vidout.g = backdrop_color_register.g ? 230 : 16;
+            vidout.b = backdrop_color_register.b ? 230 : 16;
         end
+
+        backdrop_pixel = (!plane_a_visible_q && !plane_b_visible_q);
 
         if (transparency_control_register.mx) begin
             // No Mix. Only overlay
@@ -1318,16 +1343,6 @@ module mcd212 (
         if (debug_force_video_plane == 2'b01) vidout = plane_a_q;
         else if (debug_force_video_plane == 2'b10) vidout = plane_b_q;
 
-        if (debug_limited_to_full == 1) begin
-            vidout.r = limited_to_full1(vidout.r);
-            vidout.g = limited_to_full1(vidout.g);
-            vidout.b = limited_to_full1(vidout.b);
-        end else if (debug_limited_to_full == 2) begin
-            vidout.r = limited_to_full2(vidout.r);
-            vidout.g = limited_to_full2(vidout.g);
-            vidout.b = limited_to_full2(vidout.b);
-        end
-
         // cursor
         if (cursor_pixel_q && inside_cursor_window_q && cursor_control_register.en) begin
             backdrop_pixel = 0;
@@ -1344,9 +1359,13 @@ module mcd212 (
         end
 
         vsd = backdrop_pixel && image_coding_method_register.ev;
-`ifdef VERILATOR
-        //vsd = 1;
-`endif
+
+        // Ensure that blank areas are colored "black", just in case
+        if (hblank || vblank || !command_register_dcr1.de) begin
+            vidout.r = 16;
+            vidout.g = 16;
+            vidout.b = 16;
+        end
     end
 
     // Implementation of Table 5-13 Register Map
@@ -1510,12 +1529,8 @@ module mcd212 (
     // According to 5.4.4.5 CLUT Bank Register, A7 is forced 1
     assign clut_wr_addr1 = {1'b1, clut_bank1, ch1_register_adr[5:0]};
 
-    assign clut_wr_data0 = {
-        ch0_register_data[23:18], ch0_register_data[15:10], ch0_register_data[7:2]
-    };
-    assign clut_wr_data1 = {
-        ch1_register_data[23:18], ch1_register_data[15:10], ch1_register_data[7:2]
-    };
+    assign clut_wr_data0 = ch0_register_data;
+    assign clut_wr_data1 = ch1_register_data;
 
     assign clut_we0 = (ch0_register_adr <= 7'h3f) && ch0_register_write;
     assign clut_we1 = (ch1_register_adr <= 7'h3f) && ch1_register_write;
@@ -1727,17 +1742,17 @@ endmodule
 // to ensure that this is indeed a True Dual-Port RAM with Single Clock
 module clut_dual_port_memory (
     input clk,
-    input clut_entry_s data_a,
-    input clut_entry_s data_b,
+    input rgb888_s data_a,
+    input rgb888_s data_b,
     input [7:0] addr_a,
     input [7:0] addr_b,
     input we_a,
     input we_b,
-    output clut_entry_s q_a,
-    output clut_entry_s q_b
+    output rgb888_s q_a,
+    output rgb888_s q_b
 );
     // Declare the RAM variable
-    clut_entry_s ram[256]  /*verilator public_flat_rw*/;
+    rgb888_s ram[256]  /*verilator public_flat_rw*/;
 
     // Port A 
     always @(posedge clk) begin

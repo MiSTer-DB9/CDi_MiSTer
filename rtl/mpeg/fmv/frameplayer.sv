@@ -11,6 +11,7 @@ module frameplayer (
     ddr_if.to_host ddrif,
 
     output rgb888_s vidout,
+    output window_scan_started,
 
     input vcd_pixel_clock,
     input debug_activate_vcd_filter,
@@ -164,8 +165,10 @@ module frameplayer (
     bit y_requested;
 
     bit [8:0] vertical_offset_wait;
+    assign window_scan_started = !vblank && vertical_offset_wait == 0 &&
+        fetch_and_show_frame_clkvideo;
     bit [10:0] horizontal_offset_wait;
-    bit [8:0] latched_offset_x;
+    bit [ 8:0] latched_offset_x;
 
     always_ff @(posedge clkddr) begin
         if (vblank_clkddr) begin
@@ -371,10 +374,10 @@ module frameplayer (
             Cr = {2'b00, current_color.v};
         end
 
-        // According to ITU-R BT.601
-        r = ((Y - 16) * 298 + 409 * (Cr - 128)) / 256;
-        g = ((Y - 16) * 298 - 100 * (Cb - 128) - 208 * (Cr - 128)) / 256;
-        b = ((Y - 16) * 298 + 516 * (Cb - 128)) / 256;
+        // Full-range BT.601/JPEG Y'CbCr: Y' spans 0..255 (not 16..235).
+        r = (Y * 256 + 359 * (Cr - 128)) / 256;
+        g = (Y * 256 - 88 * (Cb - 128) - 183 * (Cr - 128)) / 256;
+        b = (Y * 256 + 454 * (Cb - 128)) / 256;
 
         vidout.r = clamp8(r);
         vidout.g = clamp8(g);

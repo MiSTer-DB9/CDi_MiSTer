@@ -58,6 +58,12 @@ module emu (
     output        HDMI_BLACKOUT,
     output        HDMI_BOB_DEINT,
 
+    input [ 5:0] LFB_FMT,
+    input [31:0] LFB_BASE,
+    input [11:0] LFB_WIDTH,
+    input [11:0] LFB_HEIGHT,
+    input [13:0] LFB_STRIDE,
+
 `ifdef MISTER_FB
     // Use framebuffer in DDRAM
     // FB_FORMAT:
@@ -319,8 +325,9 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         "P1O[4],Video Region,PAL (50 Hz),NTSC (60 Hz);",
         "P1O[33:32],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
         "P1O[35:34],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-        "P1O[39],Vertical Crop,Off,On(270);",
-        "P1O[10:9],RGB Scale,0-255,16-235,16-255;",
+        "P1O[43:42],Vertical Crop,Off,On(270),On(216);",
+        "P1O[40],CLUT Bits,Original(18),24;",
+        "P1O[41],Crop ST border,No,Yes;",
         "P1-;",
         "P1O[26:24],Audio Mixing,Original,CDIC unmixed,VMPEG unmixed,VMPEG Left,VMPEG Right;",
 
@@ -363,8 +370,8 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         "R[0],Reset and close OSD;",
         "v,0;",  // [optional] config version 0-99. 
                  // If CONF_STR options are changed in incompatible way, then change version number too,
-        "J1,B1,B2,B1+B2;",
-        "jn,B,A,Y;",
+        "J1,B1,B2,B1+B2,Alt B1;",
+        "jn,B,A,Y,X;",
         // so all options will get default values on first start.
         "I,",
         "NvRAM saved;",
@@ -444,11 +451,12 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     bit [1:0] debug_force_video_plane = 0;
     bit enable_reset_on_nvram_img_mount = 0;
     bit enable_reset_on_cd_img_mount = 0;
-    bit [1:0] debug_limited_to_full = 0;
     bit audio_cd_in_tray  /*verilator public_flat_rw */ = 0;
     bit config_disable_cpu_starve  /*verilator public_flat_rw */ = 1;
+    bit config_rgb888  /*verilator public_flat_rw */ = 1;
     bit config_auto_play  /*verilator public_flat_rw */ = 1;
     bit config_disable_vmpeg = 0;
+    bit config_crop_st = 1;
     bit config_first_player_back_port = 0;
     bit config_disable_seek_time  /*verilator public_flat_rw */ = 1;
     bit debug_disable_vcd_clock = 0;
@@ -468,8 +476,8 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     wire overclock_pointing_device = status[5];
     wire [1:0] debug_force_video_plane = status[7:6];
     wire enable_reset_on_nvram_img_mount = !status[8];
-    wire [1:0] debug_limited_to_full = status[10:9];
     wire config_disable_cpu_starve = status[11];
+    wire config_rgb888 = status[40];
     wire audio_cd_in_tray = status[12];
     bit config_disable_vmpeg = 0;  // synced status[13];
     wire config_auto_play = !status[14];
@@ -486,7 +494,9 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
 
     wire [1:0] ar = status[33:32];
     wire [1:0] video_freak_scale = status[35:34];
-    wire vcrop_en = status[39];
+    wire [1:0] vcrop_en = status[43:42];
+    wire config_crop_st = status[41];
+
 
     always_ff @(posedge clk_sys) begin
         // only change during resets
@@ -502,7 +512,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .clk_sys  (clk_sys),
         .HPS_BUS  (HPS_BUS),
         .EXT_BUS  (),
-        .gamma_bus(),
+        .gamma_bus(gamma_bus),
 
         .forced_scandoubler(forced_scandoubler),
 
@@ -559,13 +569,27 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .RTC(hps_rtc)
     );
 
+    // Cropping has multiple purposes
+    // 1. Allow integer scaling with 1080p
+    // 2. Remove safety margins that would not be perceivable on real CRTs due to overscan
+    bit [11:0] crop_size;
+    always_comb begin
+        crop_size = 0; // No crop
+        case (vcrop_en)
+            1: crop_size = 10'd270;  // 1080/4. Might be good for 50 Hz
+            2: crop_size = 10'd216;  // 1080/5. Might be good for 60 Hz
+        endcase
+    end
+
     video_freak video_freak (
         .*,
+        .VGA_VS(VSync),
+        .VGA_DE(video_de),
         .VGA_DE_IN(~(HBlank | VBlank)),
         .ARX((!ar) ? 13'd4 : (13'(ar) - 13'd1)),
         .ARY((!ar) ? 13'd3 : 13'd0),
-        .CROP_SIZE(vcrop_en ? 10'd270 : 10'd0),
-        .CROP_OFF(0),
+        .CROP_SIZE(crop_size),
+        .CROP_OFF(0), // TODO Not sure about the offset yet
         .SCALE(video_freak_scale)
     );
 `endif
@@ -767,6 +791,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         else if (cd_hps_req) cd_hps_req_during_power_cycle <= 1;
     end
 
+    /* verilator tracing_off */
     sdram sdram (
         .*,
         .init(0),  //~clock_locked),
@@ -783,6 +808,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .burst(prepare_sdram ? 1'b0 : sdram_burst),
         .burstdata_valid(sdram_burstdata_valid)
     );
+    /* verilator tracing_on */
 
 `ifdef VERILATOR
     // DDR3 simulation
@@ -902,6 +928,9 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     wire VBlank;
     wire VSync;
     wire ce_pix;
+    wire [21:0] gamma_bus;
+    wire video_de;
+    wire video_f1;
     wire [7:0] r  /*verilator public_flat_rd*/;
     wire [7:0] g  /*verilator public_flat_rd*/;
     wire [7:0] b  /*verilator public_flat_rd*/;
@@ -949,6 +978,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     wire cd_data_valid;
     wire cd_stop_sector_delivery;
 
+    /* verilator tracing_off */
     hps_cd_sector_cache hps_cd_sector_cache (
         .clk(clk_sys),
         .reset(cditop_reset),
@@ -971,6 +1001,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
 
         .config_disable_seek_time
     );
+    /* verilator tracing_on */
 
     wire forced_snac_rts;
     wire forced_rts_flag;
@@ -1078,7 +1109,6 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .debug_disable_vcd_clock,
         .debug_activate_vcd_filter,
         .debug_force_video_plane,
-        .debug_limited_to_full,
         .audio_cd_in_tray,
         .config_audio_mixing,
 
@@ -1088,7 +1118,7 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .HSync (HSync),
         .VBlank(VBlank),
         .VSync (VSync),
-        .vga_f1(VGA_F1),
+        .vga_f1(video_f1),
 
         .vidout(cdi_video_out),
 
@@ -1146,8 +1176,10 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
         .fail_not_enough_words(fail_not_enough_words),
         .fail_too_much_data(fail_too_much_data),
         .config_disable_cpu_starve,
+        .config_rgb888,
         .config_auto_play,
         .config_disable_vmpeg(config_disable_vmpeg),
+        .config_crop_st(config_crop_st),
 
         .hps_rtc(hps_rtc)
     );
@@ -1157,13 +1189,36 @@ assign USER_OUT[7] = USER_OUT_DRIVE[7]; // DB9 8th pin; USER_OUT[6:0] driven by 
     assign CE_PIXEL = ce_pix;
 `ifdef VERILATOR
     // when the videofreak is not used.
-    assign VGA_DE = ~(HBlank | VBlank);
+    assign video_de = ~(HBlank | VBlank);
+    // The simulator has no HPS interface to load or enable gamma curves.
+    assign gamma_bus[20:0] = {clk_sys, 20'd0};
 `endif
-    assign VGA_HS = HSync;
-    assign VGA_VS = VSync;
-    assign VGA_R = r;
-    assign VGA_G = g;
-    assign VGA_B = b;
+
+    // ce_pix runs every two clocks, requiring the parallel gamma lookup.
+    // Keep RGB, sync, cropped display enable and field on the same pixel.
+    gamma_fast gamma (
+        .clk_vid(CLK_VIDEO),
+        .ce_pix(ce_pix),
+        .gamma_bus(gamma_bus),
+        .HSync(HSync),
+        .VSync(VSync),
+        .HBlank(HBlank),
+        .VBlank(VBlank),
+        .DE(video_de),
+        .RGB_in({r, g, b}),
+        .HSync_out(VGA_HS),
+        .VSync_out(VGA_VS),
+        .HBlank_out(),
+        .VBlank_out(),
+        .DE_out(VGA_DE),
+        .RGB_out({VGA_R, VGA_G, VGA_B})
+    );
+
+    reg [1:0] video_f1_delay;
+    always @(posedge CLK_VIDEO) begin
+        if (ce_pix) video_f1_delay <= {video_f1_delay[0], video_f1};
+    end
+    assign VGA_F1 = video_f1_delay[1];
 
     // ----- NvRAM Backup and Restore Handling -----
 
